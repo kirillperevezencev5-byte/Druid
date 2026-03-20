@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Telegram бот для скачивания медиа (YouTube, TikTok, Instagram и др.)
+Поддержка каруселей, отправка фото как фото.
+"""
+
+import os
+import logging
+import subprocess
+import re
+import json
+import time
+import requests
+import tempfile
+from typing import Optional, List, Tuple, Dict, Any
+
+from telegram import Update, InputMediaPhoto
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Константы
+MAX_FILE_SIZE = 50 * 1024 * 1024
+MAX_MEDIA_GROUP = 10
+DOWNLOADS_DIR = "downloads"
+
+def sanitize_filename(title: str) -> str:
+    """Очищает название файла от недопустимых символов"""
+    title = re.sub(r'[\\/*?:"<>|]', "", title)
+    if len(title) > 100:
+        title = title[:100]
+    title = re.sub(r'[#@$%&]', '', title)
+    title = title.replace(' ', '_')
+    return title.strip()
+
+def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Получает информацию о контенте TikTok через API.
+    Возвращает словарь с ключами:
+        - 'type': 'photo' или 'video'
+        - 'images': список URL фото (для фото)
+        - 'video_url': URL видео (для видео)
+    В случае ошибки возвращает None.
+    """
+    try:
+        api_url = "https://tikwm.com/api/"
+        params = {
+            "url": url,
+            "count": 12,
+            "cursor": 0,
+            "web": 1,
+            "hd": 1
+        }
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        }
+        
+        logger.info(f"Запрос к API TikTok: {url}")
+        resp = requests.get(api_url, params=params, headers=headers, timeout=30)
+        
+        if resp.status_code != 200:
+            logger.error(f"Ошибка API: {resp.status_code}")
+            return None
+            
+        data = resp.json()
+        if data.get('code') != 0:
+            logger.error(f"API вернул ошибку: {data.get('msg')}")
+            return None
+            
+        video_data = data.get('data', {})
+        images = video_data.get('images')
+        video_url = video_data.get('play')
+        
+        if images and isinstance(images, list) and len(images) > 0:
+            # Это фото (карусель или одиночное)
+            return {
+                'type': 'photo',
+                'images': images,
+                'video_url': None
+            }
+        elif video_url:
+            # Это видео
+            return {
+                'type': 'video',
+                'images': [],
+                'video_url': video_url
+            }
+        else:
+            logger.error("Не удалось определить тип контента")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Ошибка получения информации TikTok: {e}")
+        return None
+
+async def download_tiktok_photos(images: List[str], output_dir: str) -> List[str]:
+    """
+    Скачивает список фото из TikTok.
+    Возвращает список путей к скачанным файлам.
+    """
+    photo_paths = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    for i, img_url in enumerate(images):
+        output_file = os.path.join(output_dir, f"tiktok_photo_{i+1}.jpg")
+        try:
+            img_resp = requests.get(img_url, headers=headers, timeout=30)
+            if img_resp.status_code == 200:
+                content_type = img_resp.headers.get('content-type', '')
+                if 'image' in content_type:
+                    with open(output_file, 'wb') as f:
+                        f.write(img_resp.content)
+                    photo_paths.append(output_file)
+                    logger.info(f"Скачано фото {i+1}: {output_file}")
+                else:
+                    logger.error(f"Фото {i+1} не является изображением: {content_type}")
+            else:
+                logger.error(f"Ошибка скачивания фото {i+1}: {img_resp.status_code}")
+        except Exception as e:
+            logger.error(f"Ошибка при скачивании фото {i+1}: {e}")
+    
+    return photo_paths
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений."""
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    status_msg = await update.message.reply_text("⏳ Обрабатываю запрос...")
+
+    try:
+        if re.match(r'https?://', text):
+            os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+            
+            # Специальная обработка для TikTok
+            if 'tiktok.com' in text:
+                logger.info(f"Обнаружена ссылка TikTok: {text}")
+                tiktok_info = get_tiktok_info(text)
+                
+                if tiktok_info and tiktok_info['type'] == 'photo' and tiktok_info['images']:
+                    # Это фото/карусель
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        photo_paths = await download_tiktok_photos(tiktok_info['images'], tmpdir)
+                        if photo_paths:
+                            if len(photo_paths) > 1:
+                                # Отправляем как альбом (карусель)
+                                logger.info(f"Отправляем {len(photo_paths)} фото как альбом")
+                                media = []
+                                for i, path in enumerate(photo_paths[:MAX_MEDIA_GROUP]):
+                                    with open(path, 'rb') as f:
+                                        media.append(InputMediaPhoto(
+                                            media=f,
+                                            caption=f"📸 {len(photo_paths)} фото" if i == 0 else None
+                                        ))
+                                await update.message.reply_media_group(media)
+                            else:
+                                # Одиночное фото
+                                logger.info("Отправляем одиночное фото")
+                                with open(photo_paths[0], 'rb') as f:
+                                    await update.message.reply_photo(photo=f, caption="✅ Фото")
+                            return
+                        else:
+                            await update.message.reply_text("❌ Не удалось скачать фото из TikTok.")
+                            return
+                elif tiktok_info and tiktok_info['type'] == 'video' and tiktok_info['video_url']:
+                    # Это видео - скачиваем через yt-dlp
+                    logger.info("Обрабатываем TikTok видео через yt-dlp")
+                    # Продолжаем к общей обработке через yt-dlp
+                else:
+                    # Если не удалось определить тип, пробуем yt-dlp
+                    logger.info("Не удалось определить тип TikTok, пробуем yt-dlp")
+            
+            # Для всех остальных платформ и для TikTok видео используем yt-dlp
+            try:
+                cmd = ['yt-dlp', '--dump-json', '--no-playlist', text]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    info = json.loads(result.stdout)
+                    ext = info.get('ext', '')
+                    title = info.get('title', 'media')
+                    safe_title = sanitize_filename(title)
+                    
+                    # Если это фото
+                    if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
+                        output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.{ext}")
+                        cmd = [
+                            'yt-dlp',
+                            '-f', 'best[ext=jpg]/best[ext=png]/best[ext=webp]/best',
+                            '-o', output_file,
+                            '--no-playlist',
+                            text
+                        ]
+                        subprocess.run(cmd, capture_output=True, timeout=120)
+                        if os.path.exists(output_file):
+                            with open(output_file, 'rb') as f:
+                                await update.message.reply_photo(photo=f, caption="✅ Фото")
+                            try:
+                                os.remove(output_file)
+                            except:
+                                pass
+                            return
+                    
+                    # Если это видео
+                    output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.mp4")
+                    cmd = [
+                        'yt-dlp',
+                        '-f', 'best[ext=mp4]/best',
+                        '-o', output_file,
+                        '--no-playlist',
+                        text
+                    ]
+                    subprocess.run(cmd, capture_output=True, timeout=300)
+                    if os.path.exists(output_file):
+                        with open(output_file, 'rb') as f:
+                            await update.message.reply_video(video=f, caption="✅ Видео")
+                        try:
+                            os.remove(output_file)
+                        except:
+                            pass
+                        return
+                        
+            except Exception as e:
+                logger.error(f"Ошибка обработки: {e}")
+            
+            await update.message.reply_text("❌ Не удалось скачать файл.")
+        else:
+            await update.message.reply_text("🔍 Отправьте ссылку на видео/пост.")
+            
+    except Exception as e:
+        logger.exception("Ошибка в handle_message")
+        await update.message.reply_text(f"⚠️ Ошибка: {str(e)[:100]}")
+    finally:
+        try:
+            await status_msg.delete()
+        except:
+            pass
+
+def cleanup_old_files(max_age_seconds: int = 3600):
+    """Очищает старые файлы."""
+    try:
+        if not os.path.exists(DOWNLOADS_DIR):
+            return
+        current = time.time()
+        for fname in os.listdir(DOWNLOADS_DIR):
+            fpath = os.path.join(DOWNLOADS_DIR, fname)
+            if os.path.isfile(fpath):
+                if current - os.path.getmtime(fpath) > max_age_seconds:
+                    os.remove(fpath)
+    except Exception as e:
+        logger.error(f"Ошибка очистки: {e}")
+
+def main():
+    token = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
+    cleanup_old_files()
+    
+    # Устанавливаем библиотеки
+    try:
+        import requests
+    except ImportError:
+        os.system("pip install requests")
+    
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0
+    )
+    application = Application.builder().token(token).request(request).build()
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print("🤖 Бот Druid запущен!")
+    print("✅ Поддержка TikTok фото (карусели и одиночные)")
+    print("📱 Фото отправляются как фото, карусели — как альбомы")
+    print("🎬 Для видео используется yt-dlp")
+    application.run_polling(drop_pending_updates=True, allowed_updates=['message'])
+
+if __name__ == '__main__':
+    main()
