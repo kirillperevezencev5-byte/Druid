@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid - исправленная версия
+Telegram бот Druid - исправленная версия (с приоритетом TikTok фото)
 """
 
 import os
@@ -102,18 +102,20 @@ def format_caption(info: Dict[str, Any], platform: str, media_type: str) -> str:
     return "".join(caption_parts)
 
 def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
-    """Получает информацию о TikTok"""
+    """Получает информацию о TikTok (фото/карусель)"""
     try:
         api_url = "https://tikwm.com/api/"
         params = {"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1}
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         
         resp = requests.get(api_url, params=params, headers=headers, timeout=20)
         if resp.status_code != 200:
+            logger.error(f"TikTok API returned {resp.status_code}")
             return None
             
         data = resp.json()
         if data.get('code') != 0:
+            logger.error(f"TikTok API error code {data.get('code')}: {data.get('msg')}")
             return None
             
         video_data = data.get('data', {})
@@ -139,7 +141,7 @@ def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
 async def download_tiktok_photos(images: List[str], output_dir: str) -> List[str]:
     """Скачивает фото TikTok"""
     photo_paths = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     
     for i, img_url in enumerate(images[:MAX_MEDIA_GROUP]):
         output_file = os.path.join(output_dir, f"photo_{i+1}.jpg")
@@ -149,9 +151,10 @@ async def download_tiktok_photos(images: List[str], output_dir: str) -> List[str
                 with open(output_file, 'wb') as f:
                     f.write(img_resp.content)
                 photo_paths.append(output_file)
+            else:
+                logger.warning(f"Failed to download {img_url}: status {img_resp.status_code}")
         except Exception as e:
             logger.error(f"Download photo error: {e}")
-            pass
     
     return photo_paths
 
@@ -202,7 +205,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             os.makedirs(DOWNLOADS_DIR, exist_ok=True)
             
-            # TikTok фото
+            # ========== 1. СПЕЦИАЛЬНАЯ ОБРАБОТКА TikTok ФОТО (карусель) ==========
             if 'tiktok.com' in text and '/photo/' in text:
                 tiktok_info = get_tiktok_info(text)
                 if tiktok_info and tiktok_info.get('images'):
@@ -223,13 +226,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
                             await status_msg.delete()
                             return
+                    # Если не удалось получить фото, выводим ошибку и завершаем
+                    await update.message.reply_text("❌ Не удалось обработать TikTok фото. Возможно, ссылка недействительна или контент скрыт.")
+                    await status_msg.delete()
+                    return
             
+            # ========== 2. ОБРАБОТКА ЧЕРЕЗ YT-DLP (видео, фото, аудио) ==========
             # Получаем информацию через yt-dlp
             cmd_info = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', text]
             result = subprocess.run(cmd_info, capture_output=True, text=True, timeout=30)
             
             if result.returncode != 0:
-                await update.message.reply_text("❌ Не удалось получить информацию о видео")
+                # yt-dlp не смог получить информацию, возможно, ссылка не поддерживается
+                logger.error(f"yt-dlp info error: {result.stderr}")
+                await update.message.reply_text("❌ Не удалось получить информацию о видео. Возможно, ссылка не поддерживается или требуется логин.")
                 await status_msg.delete()
                 return
                 
@@ -237,30 +247,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = info.get('title', 'media')
             ext = info.get('ext', '')
             
-            # Фото
-            if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
+            # Обработка фото (расширения изображений)
+            if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'jfif', 'bmp'):
                 safe_title = sanitize_filename(title)
                 output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.{ext}")
                 
                 cmd = ['yt-dlp', '-o', output_file, '--no-playlist', '--no-warnings', text]
-                subprocess.run(cmd, capture_output=True, timeout=120)
+                proc = subprocess.run(cmd, capture_output=True, timeout=120)
                 
-                if os.path.exists(output_file) and os.path.getsize(output_file) <= MAX_FILE_SIZE:
+                if proc.returncode != 0:
+                    logger.error(f"yt-dlp download photo error: {proc.stderr}")
+                    await update.message.reply_text(f"❌ Не удалось скачать фото\n🔗 {text}")
+                elif os.path.exists(output_file) and os.path.getsize(output_file) <= MAX_FILE_SIZE:
                     media_info = {
                         'author': info.get('uploader', info.get('channel', 'Неизвестный')),
                         'description': title,
                         'url': text
                     }
                     caption = format_caption(media_info, get_platform_name(text), "фото")
-                    with open(output_file, 'rb') as f:
-                        await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
-                    os.remove(output_file)
+                    try:
+                        with open(output_file, 'rb') as f:
+                            await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
+                    except Exception as e:
+                        logger.error(f"Send photo error: {e}")
+                        await update.message.reply_text(f"⚠️ Ошибка отправки фото: {str(e)[:100]}")
+                    finally:
+                        if os.path.exists(output_file):
+                            os.remove(output_file)
                 else:
-                    await update.message.reply_text(f"❌ Не удалось скачать фото\n🔗 {text}")
+                    await update.message.reply_text(f"❌ Не удалось скачать фото (возможно, большой размер)\n🔗 {text}")
                 await status_msg.delete()
                 return
             
-            # Видео
+            # Обработка видео
             safe_title = sanitize_filename(title)
             output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.mp4")
             
@@ -274,14 +293,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }
                 caption = format_caption(media_info, get_platform_name(text), "видео")
                 
-                with open(output_file, 'rb') as f:
-                    await update.message.reply_video(
-                        video=f,
-                        caption=caption,
-                        parse_mode='HTML',
-                        supports_streaming=True
-                    )
-                os.remove(output_file)
+                try:
+                    with open(output_file, 'rb') as f:
+                        await update.message.reply_video(
+                            video=f,
+                            caption=caption,
+                            parse_mode='HTML',
+                            supports_streaming=True
+                        )
+                except Exception as e:
+                    logger.error(f"Send video error: {e}")
+                    await update.message.reply_text(f"⚠️ Ошибка отправки видео: {str(e)[:100]}")
+                finally:
+                    if os.path.exists(output_file):
+                        os.remove(output_file)
             else:
                 await update.message.reply_text(f"❌ Не удалось скачать видео\n🔗 {text}")
             
@@ -323,7 +348,7 @@ def cleanup_old_files():
 
 def main():
     """Запуск бота"""
-    # Создаем директорию для загрузок
+    # Создаём директорию для загрузок
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
     cleanup_old_files()
     
