@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid - исправленная версия (с приоритетом TikTok фото)
+Telegram бот Druid - исправленная версия (с приоритетом TikTok фото + fallback yt-dlp)
 """
 
 import os
@@ -102,13 +102,16 @@ def format_caption(info: Dict[str, Any], platform: str, media_type: str) -> str:
     return "".join(caption_parts)
 
 def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
-    """Получает информацию о TikTok (фото/карусель)"""
+    """Получает информацию о TikTok (фото/карусель) с улучшенными заголовками"""
     try:
         api_url = "https://tikwm.com/api/"
         params = {"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1}
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://www.tiktok.com/'
+        }
         
-        resp = requests.get(api_url, params=params, headers=headers, timeout=20)
+        resp = requests.get(api_url, params=params, headers=headers, timeout=30)
         if resp.status_code != 200:
             logger.error(f"TikTok API returned {resp.status_code}")
             return None
@@ -120,6 +123,9 @@ def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
             
         video_data = data.get('data', {})
         images = video_data.get('images')
+        # Если нет массива images, но есть одно фото в поле image
+        if not images and video_data.get('image'):
+            images = [video_data['image']]
         
         if images and len(images) > 0:
             author = video_data.get('author', {})
@@ -139,9 +145,12 @@ def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
         return None
 
 async def download_tiktok_photos(images: List[str], output_dir: str) -> List[str]:
-    """Скачивает фото TikTok"""
+    """Скачивает фото TikTok с правильным Referer"""
     photo_paths = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.tiktok.com/'
+    }
     
     for i, img_url in enumerate(images[:MAX_MEDIA_GROUP]):
         output_file = os.path.join(output_dir, f"photo_{i+1}.jpg")
@@ -226,10 +235,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
                             await status_msg.delete()
                             return
-                    # Если не удалось получить фото, выводим ошибку и завершаем
-                    await update.message.reply_text("❌ Не удалось обработать TikTok фото. Возможно, ссылка недействительна или контент скрыт.")
-                    await status_msg.delete()
-                    return
+                # Если не удалось получить фото через API, пробуем yt-dlp (fallback)
+                logger.info("TikTok photo API failed, falling back to yt-dlp")
+                # Продолжаем выполнение кода ниже для обработки через yt-dlp
             
             # ========== 2. ОБРАБОТКА ЧЕРЕЗ YT-DLP (видео, фото, аудио) ==========
             # Получаем информацию через yt-dlp
