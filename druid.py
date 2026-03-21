@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid - исправленная версия без спама
+Telegram бот Druid - исправленная версия
 """
 
 import os
@@ -15,7 +15,7 @@ import tempfile
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
 
-from telegram import Update, InputMediaVideo, InputMediaPhoto
+from telegram import Update, InputMediaPhoto
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
@@ -27,20 +27,20 @@ DOWNLOADS_DIR = "downloads"
 CLEANUP_HOURS = 2
 # ===================================
 
-# Настройка логирования - убираем лишние сообщения
+# Настройка логирования - только ошибки
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.WARNING  # Только предупреждения и ошибки
+    level=logging.ERROR
 )
 logger = logging.getLogger(__name__)
 
-# Проверяем наличие yt-dlp ОДИН РАЗ при импорте
-YTDLP_AVAILABLE = False
-try:
-    subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True)
-    YTDLP_AVAILABLE = True
-except:
-    pass
+def is_ytdlp_available() -> bool:
+    """Проверяет доступность yt-dlp"""
+    try:
+        subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True, timeout=5)
+        return True
+    except:
+        return False
 
 def sanitize_filename(title: str) -> str:
     """Очищает название файла"""
@@ -106,7 +106,7 @@ def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
     try:
         api_url = "https://tikwm.com/api/"
         params = {"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1}
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         
         resp = requests.get(api_url, params=params, headers=headers, timeout=20)
         if resp.status_code != 200:
@@ -132,13 +132,14 @@ def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
                 'url': url
             }
         return None
-    except Exception:
+    except Exception as e:
+        logger.error(f"TikTok info error: {e}")
         return None
 
 async def download_tiktok_photos(images: List[str], output_dir: str) -> List[str]:
     """Скачивает фото TikTok"""
     photo_paths = []
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     
     for i, img_url in enumerate(images[:MAX_MEDIA_GROUP]):
         output_file = os.path.join(output_dir, f"photo_{i+1}.jpg")
@@ -148,14 +149,15 @@ async def download_tiktok_photos(images: List[str], output_dir: str) -> List[str
                 with open(output_file, 'wb') as f:
                     f.write(img_resp.content)
                 photo_paths.append(output_file)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Download photo error: {e}")
             pass
     
     return photo_paths
 
 async def download_video_ytdlp(url: str, output_file: str) -> bool:
-    """Скачивает видео"""
-    if not YTDLP_AVAILABLE:
+    """Скачивает видео через yt-dlp"""
+    if not is_ytdlp_available():
         return False
         
     try:
@@ -164,120 +166,144 @@ async def download_video_ytdlp(url: str, output_file: str) -> bool:
             '-f', 'best[height<=720][ext=mp4]/best[height<=480][ext=mp4]/best',
             '-o', output_file,
             '--no-playlist',
+            '--no-warnings',
             url
         ]
         
         result = subprocess.run(cmd, capture_output=True, timeout=600)
         
         if result.returncode != 0:
+            logger.error(f"yt-dlp error: {result.stderr}")
             return False
             
         return os.path.exists(output_file) and os.path.getsize(output_file) <= MAX_FILE_SIZE
         
-    except Exception:
+    except Exception as e:
+        logger.error(f"Download error: {e}")
         return False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главный обработчик сообщений"""
-    text = update.message.text.strip()
-    
-    if not is_url(text):
-        return
-    
-    if not YTDLP_AVAILABLE:
-        await update.message.reply_text("❌ Бот временно недоступен. Технические работы.")
-        return
-    
-    status_msg = await update.message.reply_text("⏳ Обрабатываю...")
-    
     try:
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        text = update.message.text.strip()
         
-        # TikTok фото
-        if 'tiktok.com' in text and '/photo/' in text:
-            tiktok_info = get_tiktok_info(text)
-            if tiktok_info and tiktok_info.get('images'):
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    photos = await download_tiktok_photos(tiktok_info['images'], tmpdir)
-                    if photos:
-                        caption = format_caption(tiktok_info, "TikTok", "карусель" if len(photos) > 1 else "фото")
-                        
-                        if len(photos) > 1:
-                            media = []
-                            for i, path in enumerate(photos):
-                                with open(path, 'rb') as f:
-                                    cap = caption if i == 0 else None
-                                    media.append(InputMediaPhoto(media=f, caption=cap, parse_mode='HTML'))
-                            await update.message.reply_media_group(media)
-                        else:
-                            with open(photos[0], 'rb') as f:
-                                await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
-                        return
-        
-        # Получаем информацию
-        cmd_info = ['yt-dlp', '--dump-json', '--no-playlist', text]
-        result = subprocess.run(cmd_info, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode != 0:
-            await update.message.reply_text("❌ Не удалось получить информацию")
+        if not is_url(text):
             return
-            
-        info = json.loads(result.stdout)
-        title = info.get('title', 'media')
-        ext = info.get('ext', '')
         
-        # Фото
-        if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
+        if not is_ytdlp_available():
+            await update.message.reply_text(
+                "❌ yt-dlp не установлен.\n"
+                "Установите командой: pip install yt-dlp"
+            )
+            return
+        
+        status_msg = await update.message.reply_text("⏳ Обрабатываю...")
+        
+        try:
+            os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+            
+            # TikTok фото
+            if 'tiktok.com' in text and '/photo/' in text:
+                tiktok_info = get_tiktok_info(text)
+                if tiktok_info and tiktok_info.get('images'):
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        photos = await download_tiktok_photos(tiktok_info['images'], tmpdir)
+                        if photos:
+                            caption = format_caption(tiktok_info, "TikTok", "карусель" if len(photos) > 1 else "фото")
+                            
+                            if len(photos) > 1:
+                                media = []
+                                for i, path in enumerate(photos):
+                                    with open(path, 'rb') as f:
+                                        cap = caption if i == 0 else None
+                                        media.append(InputMediaPhoto(media=f, caption=cap, parse_mode='HTML'))
+                                await update.message.reply_media_group(media)
+                            else:
+                                with open(photos[0], 'rb') as f:
+                                    await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
+                            await status_msg.delete()
+                            return
+            
+            # Получаем информацию через yt-dlp
+            cmd_info = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', text]
+            result = subprocess.run(cmd_info, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                await update.message.reply_text("❌ Не удалось получить информацию о видео")
+                await status_msg.delete()
+                return
+                
+            info = json.loads(result.stdout)
+            title = info.get('title', 'media')
+            ext = info.get('ext', '')
+            
+            # Фото
+            if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif'):
+                safe_title = sanitize_filename(title)
+                output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.{ext}")
+                
+                cmd = ['yt-dlp', '-o', output_file, '--no-playlist', '--no-warnings', text]
+                subprocess.run(cmd, capture_output=True, timeout=120)
+                
+                if os.path.exists(output_file) and os.path.getsize(output_file) <= MAX_FILE_SIZE:
+                    media_info = {
+                        'author': info.get('uploader', info.get('channel', 'Неизвестный')),
+                        'description': title,
+                        'url': text
+                    }
+                    caption = format_caption(media_info, get_platform_name(text), "фото")
+                    with open(output_file, 'rb') as f:
+                        await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
+                    os.remove(output_file)
+                else:
+                    await update.message.reply_text(f"❌ Не удалось скачать фото\n🔗 {text}")
+                await status_msg.delete()
+                return
+            
+            # Видео
             safe_title = sanitize_filename(title)
-            output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.{ext}")
+            output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.mp4")
             
-            cmd = ['yt-dlp', '-o', output_file, '--no-playlist', text]
-            subprocess.run(cmd, capture_output=True, timeout=120)
+            await status_msg.edit_text("⏳ Скачиваю видео...")
             
-            if os.path.exists(output_file):
+            if await download_video_ytdlp(text, output_file):
                 media_info = {
                     'author': info.get('uploader', info.get('channel', 'Неизвестный')),
                     'description': title,
                     'url': text
                 }
-                caption = format_caption(media_info, get_platform_name(text), "фото")
+                caption = format_caption(media_info, get_platform_name(text), "видео")
+                
                 with open(output_file, 'rb') as f:
-                    await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
+                    await update.message.reply_video(
+                        video=f,
+                        caption=caption,
+                        parse_mode='HTML',
+                        supports_streaming=True
+                    )
                 os.remove(output_file)
-            return
-        
-        # Видео
-        safe_title = sanitize_filename(title)
-        output_file = os.path.join(DOWNLOADS_DIR, f"{safe_title}.mp4")
-        
-        await status_msg.edit_text("⏳ Скачиваю...")
-        
-        if await download_video_ytdlp(text, output_file):
-            media_info = {
-                'author': info.get('uploader', info.get('channel', 'Неизвестный')),
-                'description': title,
-                'url': text
-            }
-            caption = format_caption(media_info, get_platform_name(text), "видео")
+            else:
+                await update.message.reply_text(f"❌ Не удалось скачать видео\n🔗 {text}")
             
-            with open(output_file, 'rb') as f:
-                await update.message.reply_video(
-                    video=f,
-                    caption=caption,
-                    parse_mode='HTML',
-                    supports_streaming=True
-                )
-            os.remove(output_file)
-        else:
-            await update.message.reply_text(f"❌ Не удалось скачать\n🔗 {text}")
-            
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {str(e)[:100]}")
-    finally:
-        try:
             await status_msg.delete()
-        except:
-            pass
+            
+        except subprocess.TimeoutExpired:
+            await update.message.reply_text("⏰ Превышено время ожидания")
+            if 'status_msg' in locals():
+                await status_msg.delete()
+        except json.JSONDecodeError:
+            await update.message.reply_text("❌ Ошибка обработки данных")
+            if 'status_msg' in locals():
+                await status_msg.delete()
+        except Exception as e:
+            logger.error(f"Processing error: {e}")
+            await update.message.reply_text(f"⚠️ Ошибка: {str(e)[:100]}")
+            if 'status_msg' in locals():
+                await status_msg.delete()
+                
+    except Exception as e:
+        logger.error(f"Handler error: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
 def cleanup_old_files():
     """Очистка старых файлов"""
@@ -288,26 +314,37 @@ def cleanup_old_files():
         for fname in os.listdir(DOWNLOADS_DIR):
             fpath = os.path.join(DOWNLOADS_DIR, fname)
             if os.path.isfile(fpath) and current - os.path.getmtime(fpath) > CLEANUP_HOURS * 3600:
-                os.remove(fpath)
+                try:
+                    os.remove(fpath)
+                except:
+                    pass
     except Exception:
         pass
 
 def main():
-    # Создаем директорию
+    """Запуск бота"""
+    # Создаем директорию для загрузок
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
     cleanup_old_files()
     
-    # Проверка yt-dlp (тихо)
-    if not YTDLP_AVAILABLE:
+    # Проверка yt-dlp (без выхода)
+    if not is_ytdlp_available():
         print("\n" + "="*50)
-        print("❌ yt-dlp не установлен!")
+        print("⚠️  ВНИМАНИЕ: yt-dlp не установлен!")
         print("="*50)
-        print("Для установки выполните команду:")
+        print("Бот будет работать, но для скачивания видео нужно установить yt-dlp:")
         print("pip install yt-dlp")
         print("="*50 + "\n")
-        return
+    else:
+        print("\n" + "="*40)
+        print("🤖 Бот Druid запущен")
+        print("="*40)
+        print(f"✅ Токен: {TOKEN[:10]}...")
+        print(f"✅ yt-dlp: установлен")
+        print(f"✅ Готов к работе")
+        print("="*40 + "\n")
     
-    # Запуск бота
+    # Настройка запросов
     request = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=60.0,
@@ -315,18 +352,16 @@ def main():
         pool_timeout=30.0
     )
     
+    # Запуск бота
     application = Application.builder().token(TOKEN).request(request).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("\n" + "="*40)
-    print("🤖 Бот Druid запущен")
-    print("="*40)
-    print(f"✅ Токен: {TOKEN[:10]}...")
-    print(f"✅ yt-dlp: установлен")
-    print(f"✅ Готов к работе")
-    print("="*40 + "\n")
-    
-    application.run_polling(drop_pending_updates=True)
+    # Запуск с обработкой ошибок
+    try:
+        application.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        print(f"❌ Ошибка запуска бота: {e}")
+        print("Проверьте подключение к интернету и токен бота")
 
 if __name__ == '__main__':
     main()
