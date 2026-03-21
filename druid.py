@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid - улучшенная версия с полной поддержкой TikTok фото
+Telegram бот Druid - новая архитектура
+- TikTok: отдельная обработка через API (фото и видео)
+- Остальные платформы: yt-dlp
 """
 
 import os
@@ -14,7 +16,7 @@ import requests
 import tempfile
 import asyncio
 from typing import Optional, List, Dict, Any, Tuple
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, unquote
 from pathlib import Path
 
 from telegram import Update, InputMediaPhoto
@@ -26,8 +28,8 @@ from telegram.error import BadRequest
 TOKEN = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 MAX_MEDIA_GROUP = 10  # Максимум фото в карусели
-CLEANUP_INTERVAL = 7200  # Очистка старых файлов каждые 2 часа (в секундах)
-YTDLP_TIMEOUT = 600  # Таймаут для yt-dlp в секундах
+CLEANUP_INTERVAL = 7200  # Очистка старых файлов каждые 2 часа
+YTDLP_TIMEOUT = 600  # Таймаут для yt-dlp
 API_TIMEOUT = 30  # Таймаут для API запросов
 # ===================================
 
@@ -60,7 +62,7 @@ def is_ytdlp_available() -> bool:
         return False
 
 def sanitize_filename(title: str) -> str:
-    """Очищает название файла от недопустимых символов"""
+    """Очищает название файла"""
     title = re.sub(r'[\\/*?:"<>|]', "", title)
     if len(title) > 80:
         title = title[:80]
@@ -103,7 +105,7 @@ def get_platform_name(url: str) -> str:
     return domain.replace('www.', '').split('.')[0].capitalize()
 
 def escape_html(text: str) -> str:
-    """Экранирует HTML символы для безопасной вставки"""
+    """Экранирует HTML символы"""
     if not text:
         return text
     return (text.replace('&', '&amp;')
@@ -119,8 +121,7 @@ def format_caption(info: Dict[str, Any], platform: str, media_type: str) -> str:
         'фото': '📸',
         'видео': '🎬',
         'карусель': '🖼️',
-        'аудио': '🎵',
-        'gif': '🎪'
+        'аудио': '🎵'
     }
     
     caption_parts.append(f"{emojis.get(media_type, '📎')} ")
@@ -154,66 +155,28 @@ def check_file_size(file_path: Path, max_size: int = MAX_FILE_SIZE) -> bool:
     except Exception:
         return False
 
-# ============ УЛУЧШЕННАЯ TIKTOK ОБРАБОТКА ============
+# ============ TIKTOK ОБРАБОТКА (ТОЛЬКО API) ============
 
-def clean_tiktok_url(url: str) -> str:
-    """Очищает URL TikTok от лишних параметров"""
-    # Убираем параметры отслеживания
-    if '?' in url:
-        base_url = url.split('?')[0]
-        # Проверяем, что это ссылка на фото/видео
-        if '/photo/' in base_url or '/video/' in base_url:
-            return base_url
-    return url
-
-def get_tiktok_info_alternative(url: str) -> Optional[Dict[str, Any]]:
-    """Альтернативный метод получения TikTok фото через другой API"""
+async def resolve_tiktok_url(short_url: str) -> str:
+    """Получает конечный URL из сокращённой ссылки vm.tiktok.com"""
     try:
-        # Пробуем через API ssstik
-        api_url = "https://www.ssstik.io/api"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'Referer': 'https://www.ssstik.io/'
-        }
-        
-        data = {'url': url, 'lang': 'en'}
-        response = requests.post(api_url, data=data, headers=headers, timeout=API_TIMEOUT)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('status') == 'ok':
-                images = []
-                # Проверяем наличие фото
-                if 'images' in result:
-                    images = result['images']
-                elif 'image' in result:
-                    images = [result['image']]
-                
-                if images:
-                    return {
-                        'type': 'photo',
-                        'images': images,
-                        'author': result.get('author', {}).get('name', 'Неизвестный'),
-                        'description': result.get('title', '')[:200],
-                        'url': url
-                    }
-        
-        return None
+        response = requests.head(short_url, allow_redirects=True, timeout=10)
+        final_url = response.url
+        logger.info(f"Resolved TikTok URL: {short_url} -> {final_url}")
+        return final_url
     except Exception as e:
-        logger.error(f"Alternative TikTok API error: {e}")
-        return None
+        logger.error(f"Error resolving TikTok URL: {e}")
+        return short_url
 
-def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
-    """Получает информацию о TikTok (фото/карусель) через несколько API"""
-    
-    # Очищаем URL
-    clean_url = clean_tiktok_url(url)
-    
-    # Пробуем основной API (tikwm)
+def get_tiktok_data(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Универсальная функция для получения данных из TikTok
+    Возвращает информацию как для фото, так и для видео
+    """
     try:
+        # Используем tikwm.com API
         api_url = "https://tikwm.com/api/"
-        params = {"url": clean_url, "count": 12, "cursor": 0, "web": 1, "hd": 1}
+        params = {"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1}
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://www.tiktok.com/'
@@ -221,145 +184,119 @@ def get_tiktok_info(url: str) -> Optional[Dict[str, Any]]:
         
         response = requests.get(api_url, params=params, headers=headers, timeout=API_TIMEOUT)
         
-        if response.status_code == 200:
-            data = response.json()
+        if response.status_code != 200:
+            logger.error(f"TikTok API error: status {response.status_code}")
+            return None
             
-            if data.get('code') == 0:
-                video_data = data.get('data', {})
-                
-                # Получаем изображения
-                images = video_data.get('images', [])
-                
-                # Если нет массива images, но есть одиночное фото
-                if not images and video_data.get('image'):
-                    images = [video_data['image']]
-                
-                if images:
-                    author = video_data.get('author', {})
-                    author_name = author.get('unique_id') or author.get('nickname', 'Неизвестный')
-                    description = video_data.get('title', '')[:200]
-                    
-                    logger.info(f"Successfully got TikTok info from tikwm.com, {len(images)} images")
-                    return {
-                        'type': 'photo',
-                        'images': images,
-                        'author': author_name,
-                        'description': description,
-                        'url': clean_url,
-                        'duration': video_data.get('duration')
-                    }
-                    
-    except Exception as e:
-        logger.error(f"TikWM API error: {e}")
-    
-    # Если основной API не сработал, пробуем альтернативный
-    logger.info("Trying alternative TikTok API...")
-    alt_result = get_tiktok_info_alternative(clean_url)
-    if alt_result:
-        logger.info("Successfully got TikTok info from alternative API")
-        return alt_result
-    
-    # Пробуем прямой парсинг HTML как последний вариант
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        }
+        data = response.json()
         
-        response = requests.get(clean_url, headers=headers, timeout=API_TIMEOUT)
+        if data.get('code') != 0:
+            logger.error(f"TikTok API error: {data.get('msg')}")
+            return None
+            
+        video_data = data.get('data', {})
         
-        if response.status_code == 200:
-            # Ищем ссылки на изображения в HTML
-            # Паттерн для поиска изображений TikTok
-            img_patterns = [
-                r'https://p\d{1,3}\.tikcdn\.com/[^"\']+\.(jpg|png|webp)',
-                r'https://www\.tikcdn\.com/[^"\']+\.(jpg|png|webp)'
-            ]
-            
-            images = []
-            for pattern in img_patterns:
-                found = re.findall(pattern, response.text)
-                if found:
-                    # Извлекаем полные URL
-                    urls = re.findall(pattern, response.text)
-                    for url in urls:
-                        if url not in images:
-                            images.append(url)
-            
-            if images:
-                logger.info(f"Found {len(images)} images via HTML parsing")
-                return {
-                    'type': 'photo',
-                    'images': images[:MAX_MEDIA_GROUP],
-                    'author': 'TikTok',
-                    'description': '',
-                    'url': clean_url
-                }
-                
+        # Получаем информацию об авторе
+        author = video_data.get('author', {})
+        author_name = author.get('unique_id') or author.get('nickname', 'Неизвестный')
+        description = video_data.get('title', '')[:200]
+        
+        # Проверяем наличие фото (карусель)
+        images = video_data.get('images', [])
+        if not images and video_data.get('image'):
+            images = [video_data['image']]
+        
+        if images:
+            # Это фото/карусель
+            logger.info(f"Detected TikTok photo/carousel with {len(images)} images")
+            return {
+                'type': 'photo',
+                'images': images,
+                'author': author_name,
+                'description': description,
+                'url': url,
+                'duration': video_data.get('duration')
+            }
+        
+        # Проверяем наличие видео
+        video_url = video_data.get('play')
+        if video_url:
+            logger.info("Detected TikTok video")
+            return {
+                'type': 'video',
+                'video_url': video_url,
+                'author': author_name,
+                'description': description,
+                'url': url,
+                'duration': video_data.get('duration')
+            }
+        
+        logger.warning("No images or video found in TikTok data")
+        return None
+        
     except Exception as e:
-        logger.error(f"HTML parsing error: {e}")
-    
-    return None
+        logger.error(f"TikTok API error: {e}")
+        return None
 
 async def download_tiktok_photos(images: List[str], output_dir: Path) -> List[Path]:
-    """Скачивает фото TikTok с правильными заголовками"""
+    """Скачивает фото TikTok"""
     photo_paths = []
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://www.tiktok.com/',
-        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9'
+        'Referer': 'https://www.tiktok.com/'
     }
     
     for i, img_url in enumerate(images[:MAX_MEDIA_GROUP]):
         output_file = output_dir / f"photo_{i+1}.jpg"
         
         try:
-            # Добавляем задержку между запросами чтобы не банили
             if i > 0:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
             
-            response = requests.get(img_url, headers=headers, timeout=API_TIMEOUT, stream=True)
+            response = requests.get(img_url, headers=headers, timeout=API_TIMEOUT)
             
             if response.status_code == 200:
-                content_type = response.headers.get('content-type', '').lower()
-                
-                # Проверяем что это изображение
-                if any(img_type in content_type for img_type in ['image', 'jpeg', 'png', 'webp']):
-                    with open(output_file, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    
-                    # Проверяем размер файла
-                    if output_file.stat().st_size > 0:
-                        photo_paths.append(output_file)
-                        logger.info(f"Downloaded photo {i+1}/{len(images[:MAX_MEDIA_GROUP])} ({output_file.stat().st_size} bytes)")
-                    else:
-                        logger.warning(f"Downloaded empty file for {img_url}")
-                else:
-                    logger.warning(f"Invalid content type for {img_url}: {content_type}")
+                with open(output_file, 'wb') as f:
+                    f.write(response.content)
+                photo_paths.append(output_file)
+                logger.info(f"Downloaded photo {i+1}/{len(images[:MAX_MEDIA_GROUP])}")
             else:
                 logger.warning(f"Failed to download {img_url}: status {response.status_code}")
                 
         except Exception as e:
-            logger.error(f"Download photo error for {img_url}: {e}")
+            logger.error(f"Download photo error: {e}")
     
     return photo_paths
 
-# ============ YT-DLP ОБРАБОТКА ============
+async def download_tiktok_video(video_url: str, output_file: Path) -> bool:
+    """Скачивает видео TikTok"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.tiktok.com/'
+        }
+        
+        response = requests.get(video_url, headers=headers, timeout=API_TIMEOUT, stream=True)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to download video: status {response.status_code}")
+            return False
+        
+        with open(output_file, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        return check_file_size(output_file)
+        
+    except Exception as e:
+        logger.error(f"Download video error: {e}")
+        return False
+
+# ============ YT-DLP ОБРАБОТКА (ДЛЯ ДРУГИХ ПЛАТФОРМ) ============
 
 async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
     """Получает информацию о медиа через yt-dlp"""
     try:
-        # Для TikTok фото пропускаем yt-dlp, так как он их не поддерживает
-        if 'tiktok.com' in url and ('/photo/' in url or 'photo' in url):
-            logger.info("Skipping yt-dlp for TikTok photo")
-            return None
-            
         cmd = [
             'yt-dlp',
             '--dump-json',
@@ -375,10 +312,7 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
         )
         
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), 
-                timeout=60
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -387,19 +321,15 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
         
         if process.returncode != 0:
             stderr_text = stderr.decode()
-            if "Unsupported URL" in stderr_text:
-                logger.info(f"URL not supported by yt-dlp: {url}")
-            else:
-                logger.error(f"yt-dlp info error: {stderr_text}")
+            logger.error(f"yt-dlp info error: {stderr_text}")
             return None
             
         info = json.loads(stdout.decode())
         
-        # Определяем тип медиа
         ext = info.get('ext', '')
-        is_video = info.get('_type') == 'video' or ext in ['mp4', 'webm', 'mkv', 'avi', 'mov']
+        is_video = ext in ['mp4', 'webm', 'mkv', 'avi', 'mov']
         is_audio = info.get('acodec') != 'none' and info.get('vcodec') == 'none'
-        is_image = ext in ['jpg', 'jpeg', 'png', 'webp', 'gif', 'jfif', 'bmp']
+        is_image = ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']
         
         media_type = 'video'
         if is_audio:
@@ -411,15 +341,12 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
             'type': media_type,
             'title': info.get('title', 'media'),
             'ext': ext,
-            'author': info.get('uploader') or info.get('channel') or info.get('creator'),
+            'author': info.get('uploader') or info.get('channel'),
             'description': info.get('description', '')[:200],
             'duration': info.get('duration'),
             'url': url
         }
         
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}")
-        return None
     except Exception as e:
         logger.error(f"get_media_info error: {e}")
         return None
@@ -448,10 +375,7 @@ async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> 
         )
         
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), 
-                timeout=YTDLP_TIMEOUT
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=YTDLP_TIMEOUT)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -469,11 +393,7 @@ async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> 
             else:
                 return False
         
-        if not check_file_size(output_file):
-            logger.warning(f"File too large: {output_file.stat().st_size}")
-            return False
-        
-        return True
+        return check_file_size(output_file)
         
     except Exception as e:
         logger.error(f"Download error: {e}")
@@ -492,20 +412,19 @@ async def send_photo_group(update: Update, photo_paths: List[Path], caption: str
                 media_group.append(InputMediaPhoto(media=f, caption=cap, parse_mode='HTML'))
         
         await update.message.reply_media_group(media_group)
-        logger.info(f"Sent {len(media_group)} photos as media group")
+        logger.info(f"Sent {len(media_group)} photos")
         
     except BadRequest as e:
-        logger.error(f"BadRequest while sending media group: {e}")
+        logger.error(f"BadRequest: {e}")
         for photo_path in photo_paths:
             try:
                 with open(photo_path, 'rb') as f:
                     await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
                 break
             except Exception as send_error:
-                logger.error(f"Error sending single photo: {send_error}")
-                
+                logger.error(f"Single photo error: {send_error}")
     except Exception as e:
-        logger.error(f"Error sending media group: {e}")
+        logger.error(f"Media group error: {e}")
         raise
 
 # ============ ОСНОВНОЙ ОБРАБОТЧИК ============
@@ -522,56 +441,94 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         status_msg = await update.message.reply_text("⏳ Обрабатываю ссылку...")
         
-        # ========== 1. СПЕЦИАЛЬНАЯ ОБРАБОТКА TikTok ФОТО ==========
-        if 'tiktok.com' in text and ('/photo/' in text or 'photo' in text):
-            await status_msg.edit_text("📸 Обнаружено TikTok фото, получаю изображения...")
+        # ========== 1. TIKTOK (ТОЛЬКО API, БЕЗ YT-DLP) ==========
+        if 'tiktok.com' in text:
+            await status_msg.edit_text("🎵 Обрабатываю TikTok...")
             
-            tiktok_info = get_tiktok_info(text)
+            # Разрешаем сокращённую ссылку
+            final_url = await resolve_tiktok_url(text)
             
-            if tiktok_info and tiktok_info.get('images'):
+            # Получаем данные через API
+            tiktok_data = get_tiktok_data(final_url)
+            
+            if not tiktok_data:
+                await status_msg.edit_text("❌ Не удалось получить данные из TikTok. Проверьте ссылку.")
+                return
+            
+            # Обработка фото/карусели
+            if tiktok_data['type'] == 'photo':
+                images = tiktok_data.get('images', [])
+                if not images:
+                    await status_msg.edit_text("❌ Не найдены изображения в посте.")
+                    return
+                
+                await status_msg.edit_text(f"📸 Найдено {len(images)} изображений, скачиваю...")
+                
                 with tempfile.TemporaryDirectory() as tmpdir:
                     tmp_path = Path(tmpdir)
-                    photos = await download_tiktok_photos(tiktok_info['images'], tmp_path)
+                    photos = await download_tiktok_photos(images, tmp_path)
                     
                     if photos:
                         media_type = "карусель" if len(photos) > 1 else "фото"
-                        caption = format_caption(tiktok_info, "TikTok", media_type)
+                        caption = format_caption(tiktok_data, "TikTok", media_type)
                         
                         if len(photos) > 1:
                             await send_photo_group(update, photos, caption)
                         else:
                             with open(photos[0], 'rb') as f:
-                                await update.message.reply_photo(
-                                    photo=f, 
-                                    caption=caption, 
-                                    parse_mode='HTML'
-                                )
+                                await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
                         
                         await status_msg.delete()
-                        return
                     else:
-                        await status_msg.edit_text("❌ Не удалось загрузить фото. Возможно, ссылка на видео или пост удален.")
-                        return
-            else:
-                await status_msg.edit_text("❌ Не удалось получить информацию о фото. Проверьте ссылку.")
+                        await status_msg.edit_text("❌ Не удалось скачать изображения.")
+                
+                return
+            
+            # Обработка видео
+            elif tiktok_data['type'] == 'video':
+                video_url = tiktok_data.get('video_url')
+                if not video_url:
+                    await status_msg.edit_text("❌ Не найдена ссылка на видео.")
+                    return
+                
+                await status_msg.edit_text("🎬 Скачиваю видео...")
+                
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path = Path(tmpdir)
+                    output_file = tmp_path / "tiktok_video.mp4"
+                    
+                    success = await download_tiktok_video(video_url, output_file)
+                    
+                    if success:
+                        caption = format_caption(tiktok_data, "TikTok", "видео")
+                        
+                        with open(output_file, 'rb') as f:
+                            await update.message.reply_video(
+                                video=f,
+                                caption=caption,
+                                parse_mode='HTML',
+                                supports_streaming=True
+                            )
+                        
+                        await status_msg.delete()
+                    else:
+                        await status_msg.edit_text("❌ Не удалось скачать видео.")
+                
                 return
         
-        # ========== 2. ПРОВЕРКА НАЛИЧИЯ YT-DLP ==========
+        # ========== 2. ВСЕ ОСТАЛЬНЫЕ ПЛАТФОРМЫ (YT-DLP) ==========
+        
+        # Проверяем yt-dlp
         if not is_ytdlp_available():
-            await status_msg.edit_text(
-                "❌ yt-dlp не установлен.\n"
-                "Установите командой: pip install yt-dlp"
-            )
+            await status_msg.edit_text("❌ yt-dlp не установлен. Установите: pip install yt-dlp")
             return
         
-        # ========== 3. ОБРАБОТКА ЧЕРЕЗ YT-DLP ==========
+        await status_msg.edit_text("🔍 Получаю информацию...")
+        
         media_info = await get_media_info_ytdlp(text)
         
         if not media_info:
-            await status_msg.edit_text(
-                "❌ Не удалось получить информацию о медиа.\n"
-                "Возможно, ссылка не поддерживается или требуется авторизация."
-            )
+            await status_msg.edit_text("❌ Не удалось получить информацию. Ссылка не поддерживается.")
             return
         
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -598,15 +555,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = await download_media_ytdlp(text, output_file, media_info['type'])
             
             if not success:
-                await status_msg.edit_text(f"❌ Не удалось скачать {media_type_rus}\n🔗 {text}")
+                await status_msg.edit_text(f"❌ Не удалось скачать {media_type_rus}")
                 return
             
             if not output_file.exists():
-                possible_files = list(tmp_path.glob(f"{safe_title}.*"))
-                if possible_files:
-                    output_file = possible_files[0]
+                possible = list(tmp_path.glob(f"{safe_title}.*"))
+                if possible:
+                    output_file = possible[0]
                 else:
-                    await status_msg.edit_text(f"❌ Файл не найден после скачивания\n🔗 {text}")
+                    await status_msg.edit_text("❌ Файл не найден")
                     return
             
             caption = format_caption(
@@ -623,41 +580,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 with open(output_file, 'rb') as f:
                     if media_info['type'] == 'image':
-                        await update.message.reply_photo(
-                            photo=f,
-                            caption=caption,
-                            parse_mode='HTML'
-                        )
+                        await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
                     elif media_info['type'] == 'audio':
                         await update.message.reply_audio(
-                            audio=f,
-                            caption=caption,
-                            parse_mode='HTML',
-                            title=safe_title,
-                            performer=media_info.get('author', 'Неизвестный')
+                            audio=f, caption=caption, parse_mode='HTML',
+                            title=safe_title, performer=media_info.get('author', 'Неизвестный')
                         )
                     else:
-                        await update.message.reply_video(
-                            video=f,
-                            caption=caption,
-                            parse_mode='HTML',
-                            supports_streaming=True
-                        )
+                        await update.message.reply_video(video=f, caption=caption, parse_mode='HTML', supports_streaming=True)
                 
-                logger.info(f"Successfully sent {media_info['type']} from {text}")
+                logger.info(f"Successfully sent {media_info['type']}")
                 
-            except BadRequest as e:
-                logger.error(f"BadRequest while sending: {e}")
-                await status_msg.edit_text(f"⚠️ Ошибка отправки: {str(e)[:100]}")
             except Exception as e:
                 logger.error(f"Send error: {e}")
-                await status_msg.edit_text(f"⚠️ Ошибка отправки медиа: {str(e)[:100]}")
+                await status_msg.edit_text(f"⚠️ Ошибка отправки: {str(e)[:100]}")
             
             await status_msg.delete()
             
     except Exception as e:
         logger.error(f"Handler error: {e}", exc_info=True)
-        error_msg = f"⚠️ Произошла ошибка: {str(e)[:100]}"
+        error_msg = f"⚠️ Ошибка: {str(e)[:100]}"
         
         if status_msg:
             try:
@@ -675,24 +617,19 @@ async def cleanup_old_files():
         try:
             if DOWNLOADS_DIR.exists():
                 current_time = time.time()
-                deleted_count = 0
-                
+                deleted = 0
                 for file_path in DOWNLOADS_DIR.iterdir():
-                    if file_path.is_file():
-                        file_age = current_time - file_path.stat().st_mtime
-                        if file_age > CLEANUP_INTERVAL:
-                            file_path.unlink()
-                            deleted_count += 1
-                
-                if deleted_count > 0:
-                    logger.info(f"Cleaned up {deleted_count} old files")
-                    
+                    if file_path.is_file() and current_time - file_path.stat().st_mtime > CLEANUP_INTERVAL:
+                        file_path.unlink()
+                        deleted += 1
+                if deleted:
+                    logger.info(f"Cleaned up {deleted} files")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
         
         await asyncio.sleep(CLEANUP_INTERVAL)
 
-# ============ ЗАПУСК БОТА ============
+# ============ ЗАПУСК ============
 
 def main():
     """Запуск бота"""
@@ -701,18 +638,18 @@ def main():
         print("\n" + "="*50)
         print("⚠️  ВНИМАНИЕ: yt-dlp не установлен!")
         print("="*50)
-        print("Бот будет работать ограниченно. Для полной функциональности:")
+        print("Для YouTube, Instagram и других платформ нужен yt-dlp:")
         print("pip install yt-dlp")
         print("="*50 + "\n")
     else:
-        print("\n" + "="*40)
-        print("🤖 Бот Druid запущен")
-        print("="*40)
+        print("\n" + "="*50)
+        print("🤖 Бот Druid запущен (новая архитектура)")
+        print("="*50)
         print(f"✅ Токен: {TOKEN[:10]}...{TOKEN[-5:]}")
-        print(f"✅ yt-dlp: установлен")
+        print(f"✅ yt-dlp: установлен (для YouTube, Instagram и др.)")
+        print(f"✅ TikTok: через API (фото и видео)")
         print(f"✅ Макс. размер: {MAX_FILE_SIZE // (1024*1024)} MB")
-        print(f"✅ Очистка файлов: каждые {CLEANUP_INTERVAL // 3600} ч")
-        print("="*40 + "\n")
+        print("="*50 + "\n")
     
     request = HTTPXRequest(
         connect_timeout=30.0,
@@ -721,14 +658,8 @@ def main():
         pool_timeout=30.0
     )
     
-    application = Application.builder()\
-        .token(TOKEN)\
-        .request(request)\
-        .build()
-    
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
+    application = Application.builder().token(TOKEN).request(request).build()
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -737,8 +668,7 @@ def main():
     try:
         application.run_polling(drop_pending_updates=True)
     except Exception as e:
-        print(f"❌ Ошибка запуска бота: {e}")
-        print("Проверьте подключение к интернету и токен бота")
+        print(f"❌ Ошибка: {e}")
     finally:
         loop.close()
 
