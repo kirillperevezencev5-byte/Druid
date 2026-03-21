@@ -182,41 +182,46 @@ async def download_tiktok_photos(images: List[str], output_dir: str) -> List[str
     
     return photo_paths
 
+def escape_html(text: str) -> str:
+    """Экранирует HTML спецсимволы"""
+    if not text:
+        return text
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
 def format_caption(info: Dict[str, Any], platform: str, media_type: str) -> str:
     """
     Формирует подпись для медиафайла с информацией об источнике.
-    
-    Args:
-        info: словарь с информацией о медиа
-        platform: название платформы
-        media_type: тип медиа ('фото', 'видео', 'карусель')
-    
-    Returns:
-        отформатированная подпись
+    Использует HTML вместо Markdown для надежности.
     """
     caption_parts = []
     
     # Добавляем эмодзи в зависимости от типа
     if media_type == 'фото':
-        caption_parts.append("📸")
+        caption_parts.append("📸 ")
     elif media_type == 'карусель':
-        caption_parts.append("🖼️")
+        caption_parts.append("🖼️ ")
     elif media_type == 'видео':
-        caption_parts.append("🎬")
+        caption_parts.append("🎬 ")
     
-    caption_parts.append(f"**{platform}**\n")
+    caption_parts.append(f"<b>{escape_html(platform)}</b>\n")
     
     # Информация об авторе
     if info.get('author'):
-        caption_parts.append(f"👤 **Автор:** {info['author']}\n")
+        author = escape_html(info['author'])
+        caption_parts.append(f"👤 <b>Автор:</b> {author}\n")
     
     # Описание (если есть)
     if info.get('description'):
-        caption_parts.append(f"📝 **Описание:** {info['description']}\n")
+        description = escape_html(info['description'])
+        # Ограничиваем длину описания
+        if len(description) > 200:
+            description = description[:200] + "..."
+        caption_parts.append(f"📝 <b>Описание:</b> {description}\n")
     
     # Исходная ссылка
     if info.get('url'):
-        caption_parts.append(f"🔗 **Источник:** {info['url']}")
+        url = info['url']
+        caption_parts.append(f"🔗 <b>Источник:</b> <a href='{url}'>ссылка</a>")
     
     return "".join(caption_parts)
 
@@ -267,7 +272,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 with open(path, 'rb') as f:
                                     # Подпись добавляем только к первому фото
                                     cap = caption if i == 0 else None
-                                    media.append(InputMediaPhoto(media=f, caption=cap, parse_mode='Markdown'))
+                                    media.append(InputMediaPhoto(media=f, caption=cap, parse_mode='HTML'))
                             await update.message.reply_media_group(media)
                         else:
                             # Одиночное фото
@@ -276,7 +281,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 await update.message.reply_photo(
                                     photo=f, 
                                     caption=caption,
-                                    parse_mode='Markdown'
+                                    parse_mode='HTML'
                                 )
                         return
                     else:
@@ -329,7 +334,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await update.message.reply_photo(
                                 photo=f, 
                                 caption=caption,
-                                parse_mode='Markdown'
+                                parse_mode='HTML'
                             )
                         try:
                             os.remove(output_file)
@@ -353,7 +358,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await update.message.reply_video(
                             video=f, 
                             caption=caption,
-                            parse_mode='Markdown'
+                            parse_mode='HTML'
                         )
                     try:
                         os.remove(output_file)
@@ -401,6 +406,15 @@ def main():
     token = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
     cleanup_old_files()
     
+    # Проверяем наличие yt-dlp
+    try:
+        subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True)
+        logger.info("yt-dlp найден")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.error("yt-dlp не установлен! Установите: pip install yt-dlp")
+        print("⚠️  ВНИМАНИЕ: yt-dlp не установлен!")
+        print("Установите командой: pip install yt-dlp")
+    
     # Устанавливаем библиотеки
     try:
         import requests
@@ -423,6 +437,7 @@ def main():
     print("✅ Поддержка TikTok фото (карусели и одиночные)")
     print("📱 Фото отправляются как фото, карусели — как альбомы")
     print("🎬 Для видео используется yt-dlp")
+    print("📝 Используется HTML формат для подписей")
     application.run_polling(drop_pending_updates=True, allowed_updates=['message'])
 
 if __name__ == '__main__':
