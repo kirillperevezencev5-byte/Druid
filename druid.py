@@ -188,6 +188,9 @@ async def get_tiktok_data_api(session: aiohttp.ClientSession, url: str) -> Optio
             
             video_url = video_data.get('play')
             if video_url:
+                # Нормализуем URL: если он относительный, добавляем базовый домен
+                if video_url.startswith('/'):
+                    video_url = f"https://tikwm.com{video_url}"
                 return {
                     'type': 'video',
                     'video_url': video_url,
