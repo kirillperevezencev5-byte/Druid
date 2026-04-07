@@ -3,6 +3,7 @@
 """
 Telegram бот Druid (исправленная версия)
 Поддерживает YouTube, Instagram, TikTok, SoundCloud и другие сайты.
+Без лишнего вывода в консоль.
 """
 
 import os
@@ -34,9 +35,10 @@ COOKIES_FILE = None  # Например: "cookies.txt"
 BROWSER_COOKIES = "chrome"  # "chrome", "firefox" или None
 # ===================================
 
+# Настройка логов – убираем INFO в консоль, оставляем только WARNING и выше
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.WARNING  # было INFO, теперь WARNING – спама не будет
 )
 logger = logging.getLogger(__name__)
 
@@ -168,30 +170,24 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
 
 def determine_media_type(info: Dict[str, Any]) -> str:
     """Определяет тип медиа: video, audio, image"""
-    # Если есть видео-кодек и нет аудио-кодека – возможно, видео без звука
     vcodec = info.get('vcodec', 'none')
     acodec = info.get('acodec', 'none')
     ext = info.get('ext', '')
     
-    # Изображения
     if ext in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'):
         return 'image'
     
-    # Чистое аудио
     if vcodec == 'none' and acodec != 'none':
         return 'audio'
     
-    # Видео (с аудио или без)
     if vcodec != 'none':
         return 'video'
     
-    # Если неопределённо, пробуем по расширению
     if ext in ('mp4', 'webm', 'mkv', 'avi', 'mov'):
         return 'video'
     if ext in ('mp3', 'm4a', 'ogg', 'wav'):
         return 'audio'
     
-    # По умолчанию считаем видео
     return 'video'
 
 async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> bool:
@@ -202,10 +198,7 @@ async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> 
     cmd = ['yt-dlp', '-o', str(output_file), '--no-playlist', '--no-warnings'] + base_args
     
     if media_type == 'video':
-        # Лучший mp4 с разрешением до 720p (с аудио)
         cmd.extend(['-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]'])
-        # Если не найден mp4, разрешаем webm (но Telegram не любит webm, лучше перекодировать – оставим как есть)
-        # Для совместимости можно добавить '--recode-video mp4', но это замедлит процесс
     elif media_type == 'image':
         cmd.extend(['-f', 'best'])
     elif media_type == 'audio':
@@ -223,7 +216,6 @@ async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> 
             logger.error(f"yt-dlp download error: {stderr.decode()}")
             return False
         
-        # Проверяем, создался ли файл
         if not output_file.exists():
             possible = list(output_file.parent.glob(f"{output_file.stem}.*"))
             if possible:
@@ -289,11 +281,9 @@ async def send_media(update: Update, file_path: Path, caption: str, media_type: 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 <b>Druid Bot (исправленная версия)</b>\n\n"
+        "🤖 <b>Druid Bot </b>\n\n"
         "Отправьте ссылку на видео/аудио/фото с YouTube, Instagram, TikTok, SoundCloud и др.\n"
-        f"⚠️ Ограничение: файл до {MAX_FILE_SIZE//(1024*1024)} МБ.\n\n"
-        "💡 Если что-то не скачивается, убедитесь, что у бота есть доступ к cookies браузера "
-        "(для Instagram и возрастных видео YouTube).",
+        f"⚠️ Ограничение: файл до {MAX_FILE_SIZE//(1024*1024)} МБ.",
         parse_mode='HTML'
     )
 
@@ -315,12 +305,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_msg = await update.message.reply_text("⏳ Обрабатываю...")
                 
                 if not check_ytdlp():
-                    await status_msg.edit_text("❌ Ошибка: yt-dlp не установлен. Установите: pip install yt-dlp")
+                    await status_msg.edit_text("❌ Ошибка: yt-dlp не установлен")
                     return
                 
                 media_info = await get_media_info_ytdlp(url)
                 if not media_info:
-                    await status_msg.edit_text("❌ Не удалось получить информацию. Ссылка не поддерживается или требуется авторизация (попробуйте установить cookies).")
+                    await status_msg.edit_text("❌ Не удалось получить информацию. Ссылка не поддерживается или требуется авторизация.")
                     return
                 
                 # Карусель Instagram (playlist)
@@ -362,9 +352,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             cap = format_caption({'author': entries[0].get('author'), 'url': url}, "Instagram", "видео")
                             await send_media(update, video_path, cap, 'video')
                             
-                            # Аудио из видео Instagram
                             audio_path = tmp_path / f"{video_path.stem}_audio.mp3"
-                            if await download_audio_separate(entry['url'] if 'entry' in locals() else url, audio_path):
+                            # Используем первый URL для аудио
+                            audio_url = entries[0]['url'] if entries else url
+                            if await download_audio_separate(audio_url, audio_path):
                                 audio_caption = f"🎧 <b>Аудио из Instagram</b>\n👤 {escape_html(entries[0].get('author', '')[:50])}"
                                 await send_media(update, audio_path, audio_caption, 'audio')
                     
@@ -430,22 +421,7 @@ async def cleanup_old_files():
         await asyncio.sleep(CLEANUP_INTERVAL)
 
 def main():
-    if not check_ytdlp():
-        print("\n⚠️  yt-dlp не установлен. Установите: pip install yt-dlp")
-        print("   Бот не сможет скачивать медиа.")
-        return
-    else:
-        print("\n✅ Druid Bot (исправленная версия) запущен")
-        print(f"   Токен: {TOKEN[:10]}...{TOKEN[-5:]}")
-        print(f"   yt-dlp: установлен")
-        print(f"   Одновременных загрузок: {MAX_CONCURRENT_DOWNLOADS}")
-        if COOKIES_FILE:
-            print(f"   Cookies: {COOKIES_FILE}")
-        elif BROWSER_COOKIES:
-            print(f"   Cookies из браузера: {BROWSER_COOKIES}")
-        else:
-            print("   Cookies: не используются (некоторые сайты могут блокировать)")
-    
+    # Никаких print-ов
     request = HTTPXRequest(connect_timeout=30, read_timeout=120, write_timeout=120, pool_timeout=30)
     application = Application.builder().token(TOKEN).request(request).build()
     application.add_handler(CommandHandler("start", start_command))
@@ -458,9 +434,9 @@ def main():
     try:
         application.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
-        print("\n👋 Бот остановлен")
+        pass
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        logger.error(f"Fatal error: {e}")
     finally:
         loop.close()
 
