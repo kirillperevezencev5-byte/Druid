@@ -3,7 +3,6 @@
 """
 Telegram бот Druid (исправленная версия)
 Поддерживает YouTube, Instagram, TikTok, SoundCloud и другие сайты.
-Без лишнего вывода в консоль.
 """
 
 import os
@@ -27,18 +26,17 @@ from telegram.error import BadRequest
 TOKEN = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_MEDIA_GROUP = 10
-CLEANUP_INTERVAL = 7200
+CLEANUP_INTERVAL = 7200          # интервал очистки (сек)
 YTDLP_TIMEOUT = 600
 MAX_CONCURRENT_DOWNLOADS = 3
-# Путь к файлу cookies (если есть) – можно оставить None для автоматического поиска в браузере
-COOKIES_FILE = None  # Например: "cookies.txt"
-BROWSER_COOKIES = "chrome"  # "chrome", "firefox" или None
+COOKIES_FILE = None              # не используем файл cookies
+BROWSER_COOKIES = None           # отключаем поиск в браузере
 # ===================================
 
-# Настройка логов – убираем INFO в консоль, оставляем только WARNING и выше
+# Настройка логов – уровень WARNING, но ошибки yt-dlp будем выводить
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING  # было INFO, теперь WARNING – спама не будет
+    level=logging.WARNING
 )
 logger = logging.getLogger(__name__)
 
@@ -61,17 +59,21 @@ def check_ytdlp():
     return YTDLP_AVAILABLE
 
 def get_ytdlp_base_args() -> List[str]:
-    """Базовые аргументы для yt-dlp (cookies, user-agent и т.д.)"""
+    """Базовые аргументы для yt-dlp (без привязки к браузеру)"""
     args = [
         '--no-warnings',
         '--no-playlist',
         '--quiet',
-        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        '--extractor-retries', '5',
+        '--retries', '5',
+        '--sleep-requests', '1',
+        '--no-check-certificate',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     ]
+    # Если есть файл cookies – используем его (можно оставить пустым)
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
         args.extend(['--cookies', COOKIES_FILE])
-    elif BROWSER_COOKIES:
-        args.extend(['--cookies-from-browser', BROWSER_COOKIES])
+    # Никаких --cookies-from-browser, чтобы не было ошибки
     return args
 
 def is_url(text: str) -> str:
@@ -123,14 +125,28 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
     if not check_ytdlp():
         return None
     
-    cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', '--quiet'] + get_ytdlp_base_args() + [url]
+    # Определяем дополнительные аргументы для некоторых платформ
+    extractor_args = []
+    domain = urlparse(url).netloc.lower()
+    if 'instagram.com' in domain:
+        extractor_args.append('instagram:api')
+    elif 'tiktok.com' in domain:
+        extractor_args.append('tiktok:api')
+    
+    cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', '--quiet'] + get_ytdlp_base_args()
+    for arg in extractor_args:
+        cmd.extend(['--extractor-args', arg])
+    cmd.append(url)
+    
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=90)
         if process.returncode != 0:
-            logger.error(f"yt-dlp info error: {stderr.decode()}")
+            # Логируем подробную ошибку для диагностики
+            err_msg = stderr.decode()
+            logger.error(f"yt-dlp info error: {err_msg}")
             return None
         info = json.loads(stdout.decode())
         
@@ -164,12 +180,14 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
             'url': url,
             'webpage_url': info.get('webpage_url', url)
         }
+    except asyncio.TimeoutError:
+        logger.error("get_media_info timeout")
+        return None
     except Exception as e:
         logger.error(f"get_media_info error: {e}")
         return None
 
 def determine_media_type(info: Dict[str, Any]) -> str:
-    """Определяет тип медиа: video, audio, image"""
     vcodec = info.get('vcodec', 'none')
     acodec = info.get('acodec', 'none')
     ext = info.get('ext', '')
@@ -204,6 +222,13 @@ async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> 
     elif media_type == 'audio':
         cmd.extend(['-f', 'bestaudio', '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0'])
         output_file = output_file.with_suffix('.mp3')
+    
+    # Добавляем extractor-args для конкретного домена (если нужно)
+    domain = urlparse(url).netloc.lower()
+    if 'instagram.com' in domain:
+        cmd.extend(['--extractor-args', 'instagram:api'])
+    elif 'tiktok.com' in domain:
+        cmd.extend(['--extractor-args', 'tiktok:api'])
     
     cmd.append(url)
     
@@ -281,9 +306,10 @@ async def send_media(update: Update, file_path: Path, caption: str, media_type: 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 <b>Druid Bot </b>\n\n"
+        "🤖 <b>Druid Bot (исправленная версия)</b>\n\n"
         "Отправьте ссылку на видео/аудио/фото с YouTube, Instagram, TikTok, SoundCloud и др.\n"
-        f"⚠️ Ограничение: файл до {MAX_FILE_SIZE//(1024*1024)} МБ.",
+        f"⚠️ Ограничение: файл до {MAX_FILE_SIZE//(1024*1024)} МБ.\n"
+        "🔄 Если ссылка не работает, попробуйте позже – сайты могут блокировать ботов.",
         parse_mode='HTML'
     )
 
@@ -305,12 +331,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_msg = await update.message.reply_text("⏳ Обрабатываю...")
                 
                 if not check_ytdlp():
-                    await status_msg.edit_text("❌ Ошибка: yt-dlp не установлен")
+                    await status_msg.edit_text("❌ Ошибка: yt-dlp не установлен. Установите: pip install yt-dlp")
                     return
                 
                 media_info = await get_media_info_ytdlp(url)
                 if not media_info:
-                    await status_msg.edit_text("❌ Не удалось получить информацию. Ссылка не поддерживается или требуется авторизация.")
+                    await status_msg.edit_text(
+                        "❌ Не удалось получить информацию.\n"
+                        "Возможные причины:\n"
+                        "• Ссылка требует авторизации (Instagram/TikTok)\n"
+                        "• Сайт временно блокирует запросы\n"
+                        "• Неверная ссылка\n\n"
+                        "Попробуйте позже или используйте другую ссылку."
+                    )
                     return
                 
                 # Карусель Instagram (playlist)
@@ -353,7 +386,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await send_media(update, video_path, cap, 'video')
                             
                             audio_path = tmp_path / f"{video_path.stem}_audio.mp3"
-                            # Используем первый URL для аудио
                             audio_url = entries[0]['url'] if entries else url
                             if await download_audio_separate(audio_url, audio_path):
                                 audio_caption = f"🎧 <b>Аудио из Instagram</b>\n👤 {escape_html(entries[0].get('author', '')[:50])}"
@@ -398,7 +430,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             except Exception as e:
                 logger.error(f"Handler error: {e}", exc_info=True)
-                error_msg = f"⚠️ Ошибка: {str(e)[:100]}"
+                error_msg = f"⚠️ Внутренняя ошибка: {str(e)[:100]}"
                 if status_msg:
                     try:
                         await status_msg.edit_text(error_msg)
@@ -407,38 +439,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await update.message.reply_text(error_msg)
 
-async def cleanup_old_files():
-    while True:
-        try:
-            if DOWNLOADS_DIR.exists():
-                import time
-                now = time.time()
-                for f in DOWNLOADS_DIR.iterdir():
-                    if f.is_file() and now - f.stat().st_mtime > CLEANUP_INTERVAL:
-                        f.unlink()
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-        await asyncio.sleep(CLEANUP_INTERVAL)
+# Функция очистки через JobQueue
+async def cleanup_old_files(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if DOWNLOADS_DIR.exists():
+            import time
+            now = time.time()
+            for f in DOWNLOADS_DIR.iterdir():
+                if f.is_file() and now - f.stat().st_mtime > CLEANUP_INTERVAL:
+                    f.unlink()
+                    logger.info(f"Deleted old file: {f.name}")
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
 
 def main():
-    # Никаких print-ов
     request = HTTPXRequest(connect_timeout=30, read_timeout=120, write_timeout=120, pool_timeout=30)
     application = Application.builder().token(TOKEN).request(request).build()
+    
+    # Периодическая очистка
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(cleanup_old_files, interval=CLEANUP_INTERVAL, first=10)
+    
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(cleanup_old_files())
-    
-    try:
-        application.run_polling(drop_pending_updates=True)
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-    finally:
-        loop.close()
+    # Запуск (без ручного создания цикла)
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
