@@ -2,12 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Telegram бот Druid (упрощённая версия)
-- Только yt-dlp для всех платформ (TikTok, YouTube, Instagram, SoundCloud и др.)
-- Без ffmpeg (не требует установки)
-- Без TikTok API (стабильно через yt-dlp)
-- Защита от множества запросов
-- Отправка аудио отдельно для видео
-- Без разделения файлов (Telegram не примет >50 МБ)
 """
 
 import os
@@ -15,10 +9,9 @@ import logging
 import subprocess
 import re
 import json
-import time
 import tempfile
 import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 from pathlib import Path
 
@@ -30,11 +23,10 @@ from telegram.error import BadRequest
 
 # ============ НАСТРОЙКИ ============
 TOKEN = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_MEDIA_GROUP = 10
 CLEANUP_INTERVAL = 7200
 YTDLP_TIMEOUT = 600
-RETRY_COUNT = 3
 MAX_CONCURRENT_DOWNLOADS = 3
 # ===================================
 
@@ -47,18 +39,26 @@ logger = logging.getLogger(__name__)
 DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
-# Глобальные ограничители
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 user_locks: Dict[int, asyncio.Lock] = {}
 
-# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+# Простая проверка при запуске (один раз)
+YTDLP_AVAILABLE = None
 
-def is_ytdlp_available() -> bool:
-    try:
-        subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True, timeout=5)
-        return True
-    except Exception:
-        return False
+def check_ytdlp():
+    global YTDLP_AVAILABLE
+    if YTDLP_AVAILABLE is None:
+        try:
+            subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True, timeout=5)
+            YTDLP_AVAILABLE = True
+        except Exception:
+            YTDLP_AVAILABLE = False
+    return YTDLP_AVAILABLE
+
+def is_url(text: str) -> str:
+    pattern = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^\s]*)?')
+    match = pattern.search(text.strip())
+    return match.group(0) if match else ""
 
 def sanitize_filename(title: str) -> str:
     title = re.sub(r'[\\/*?:"<>|]', "", title)
@@ -67,27 +67,6 @@ def sanitize_filename(title: str) -> str:
     title = title.replace(' ', '_').strip('.')
     return title if title else "media"
 
-def is_url(text: str) -> str:
-    """Извлекает первую ссылку из текста."""
-    pattern = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^\s]*)?')
-    match = pattern.search(text.strip())
-    return match.group(0) if match else ""
-
-def get_platform_name(url: str) -> str:
-    domain = urlparse(url).netloc.lower()
-    platforms = {
-        'youtube.com': 'YouTube', 'youtu.be': 'YouTube',
-        'tiktok.com': 'TikTok', 'instagram.com': 'Instagram',
-        'twitter.com': 'Twitter/X', 'x.com': 'Twitter/X',
-        'facebook.com': 'Facebook', 'vimeo.com': 'Vimeo',
-        'reddit.com': 'Reddit', 'pinterest.com': 'Pinterest',
-        'soundcloud.com': 'SoundCloud'
-    }
-    for key, value in platforms.items():
-        if key in domain:
-            return value
-    return domain.replace('www.', '').split('.')[0].capitalize()
-
 def escape_html(text: str) -> str:
     if not text:
         return text
@@ -95,7 +74,6 @@ def escape_html(text: str) -> str:
                 .replace('>', '&gt;').replace('"', '&quot;'))
 
 def format_caption(info: Dict[str, Any], platform: str, media_type: str) -> str:
-    """Формирует подпись, обрезая до 1024 символов."""
     emojis = {'фото': '📸', 'видео': '🎬', 'карусель': '🖼️', 'аудио': '🎵'}
     parts = [f"{emojis.get(media_type, '📎')} <b>{escape_html(platform)}</b>\n"]
     if info.get('author'):
@@ -122,10 +100,10 @@ def check_file_size(file_path: Path, max_size: int = MAX_FILE_SIZE) -> bool:
     except Exception:
         return False
 
-# ============ YT-DLP ОБРАБОТКА ============
-
 async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
-    """Получает информацию через yt-dlp."""
+    if not check_ytdlp():
+        return None
+    
     cmd = ['yt-dlp', '--dump-json', '--no-playlist', '--no-warnings', '--quiet', url]
     try:
         process = await asyncio.create_subprocess_exec(
@@ -137,7 +115,6 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
             return None
         info = json.loads(stdout.decode())
         
-        # Если это карусель Instagram
         if info.get('_type') == 'playlist' and 'entries' in info:
             entries = []
             for entry in info['entries']:
@@ -160,7 +137,6 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
                 return {'_type': 'playlist', 'entries': entries, 'playlist_title': info.get('title', 'Карусель')}
             return None
         
-        # Одиночное медиа
         ext = info.get('ext', '')
         is_video = ext in ['mp4', 'webm', 'mkv', 'avi', 'mov']
         is_audio = info.get('acodec') != 'none' and info.get('vcodec') == 'none'
@@ -181,8 +157,7 @@ async def get_media_info_ytdlp(url: str) -> Optional[Dict[str, Any]]:
         return None
 
 async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> bool:
-    """Скачивает медиа через yt-dlp."""
-    if not is_ytdlp_available():
+    if not check_ytdlp():
         return False
     
     cmd = ['yt-dlp', '-o', str(output_file), '--no-playlist', '--no-warnings']
@@ -206,7 +181,6 @@ async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> 
             logger.error(f"yt-dlp download error: {stderr.decode()}")
             return False
         
-        # Проверяем существование файла
         if not output_file.exists():
             possible = list(output_file.parent.glob(f"{output_file.stem}.*"))
             if possible:
@@ -219,7 +193,9 @@ async def download_media_ytdlp(url: str, output_file: Path, media_type: str) -> 
         return False
 
 async def download_audio_separate(video_url: str, output_mp3: Path) -> bool:
-    """Скачивает только аудио из видео (отдельный запрос)."""
+    if not check_ytdlp():
+        return False
+    
     cmd = [
         'yt-dlp', '-f', 'bestaudio', '--extract-audio', 
         '--audio-format', 'mp3', '-o', str(output_mp3), video_url
@@ -232,27 +208,7 @@ async def download_audio_separate(video_url: str, output_mp3: Path) -> bool:
         logger.error(f"Audio extraction error: {e}")
         return False
 
-async def download_instagram_carousel(entries: List[Dict], tmp_path: Path) -> List[Path]:
-    """Скачивает карусель Instagram."""
-    downloaded = []
-    for idx, entry in enumerate(entries):
-        media_type = entry['type']
-        safe_title = sanitize_filename(entry.get('title', f'item_{idx+1}'))
-        if media_type == 'image':
-            out_file = tmp_path / f"{safe_title}.jpg"
-        elif media_type == 'video':
-            out_file = tmp_path / f"{safe_title}.mp4"
-        else:
-            continue
-        success = await download_media_ytdlp(entry['url'], out_file, media_type)
-        if success:
-            downloaded.append(out_file)
-    return downloaded
-
-# ============ ОТПРАВКА МЕДИА ============
-
 async def send_photo_group(update: Update, photo_paths: List[Path], caption: str):
-    """Отправляет группу фото."""
     try:
         media_group = []
         for i, path in enumerate(photo_paths[:MAX_MEDIA_GROUP]):
@@ -270,12 +226,10 @@ async def send_photo_group(update: Update, photo_paths: List[Path], caption: str
                 pass
 
 async def send_media(update: Update, file_path: Path, caption: str, media_type: str):
-    """Отправляет файл (без разделения)."""
     if not check_file_size(file_path):
         await update.message.reply_text(
             f"⚠️ Файл превышает {MAX_FILE_SIZE//(1024*1024)} МБ.\n"
-            f"Telegram не позволяет отправить такой большой файл.\n"
-            f"Попробуйте скачать его самостоятельно."
+            f"Telegram не позволяет отправить такой большой файл."
         )
         return
     
@@ -289,18 +243,11 @@ async def send_media(update: Update, file_path: Path, caption: str, media_type: 
         else:
             await update.message.reply_document(document=f, caption=caption, parse_mode='HTML')
 
-# ============ ОСНОВНОЙ ОБРАБОТЧИК ============
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 <b>Druid Bot</b>\n\n"
-        "Отправьте мне ссылку на видео/аудио/фото из:\n"
-        "• TikTok\n• YouTube\n• Instagram\n• SoundCloud\n"
-        "• Twitter/X, Facebook, Vimeo, Reddit и другие\n\n"
-        "Бот скачает медиа и отправит вам.\n"
-        "Для видео также будет отправлено отдельное аудио.\n\n"
-        f"⚠️ Ограничение Telegram: файл не должен превышать {MAX_FILE_SIZE//(1024*1024)} МБ.\n"
-        f"⚡ Одновременно обрабатывается не более {MAX_CONCURRENT_DOWNLOADS} запросов.",
+        "Отправьте мне ссылку на видео/аудио/фото.\n"
+        f"⚠️ Ограничение: файл до {MAX_FILE_SIZE//(1024*1024)} МБ.",
         parse_mode='HTML'
     )
 
@@ -308,7 +255,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = None
     user_id = update.effective_user.id
     
-    # Блокировка для пользователя
     if user_id not in user_locks:
         user_locks[user_id] = asyncio.Lock()
     
@@ -320,26 +266,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not url:
                     return
                 
-                status_msg = await update.message.reply_text("⏳ Обрабатываю ссылку...")
+                status_msg = await update.message.reply_text("⏳ Обрабатываю...")
                 
-                if not is_ytdlp_available():
-                    await status_msg.edit_text("❌ yt-dlp не установлен. Установите: pip install yt-dlp")
+                if not check_ytdlp():
+                    await status_msg.edit_text("❌ Ошибка: yt-dlp не установлен")
                     return
                 
-                # Получаем информацию
                 media_info = await get_media_info_ytdlp(url)
                 if not media_info:
                     await status_msg.edit_text("❌ Не удалось получить информацию. Ссылка не поддерживается.")
                     return
                 
-                # Обработка карусели Instagram
+                # Карусель Instagram
                 if media_info.get('_type') == 'playlist':
                     entries = media_info['entries']
                     await status_msg.edit_text(f"🖼️ Карусель из {len(entries)} элементов. Скачиваю...")
                     
                     with tempfile.TemporaryDirectory() as tmpdir:
                         tmp_path = Path(tmpdir)
-                        downloaded = await download_instagram_carousel(entries, tmp_path)
+                        downloaded = []
+                        
+                        for idx, entry in enumerate(entries):
+                            media_type = entry['type']
+                            safe_title = sanitize_filename(entry.get('title', f'item_{idx+1}'))
+                            if media_type == 'image':
+                                out_file = tmp_path / f"{safe_title}.jpg"
+                            elif media_type == 'video':
+                                out_file = tmp_path / f"{safe_title}.mp4"
+                            else:
+                                continue
+                            if await download_media_ytdlp(entry['url'], out_file, media_type):
+                                downloaded.append(out_file)
                         
                         if not downloaded:
                             await status_msg.edit_text("❌ Не удалось скачать карусель.")
@@ -359,7 +316,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             cap = format_caption({'author': entries[0].get('author'), 'url': url}, "Instagram", "видео")
                             await send_media(update, video_path, cap, 'video')
                             
-                            # Отдельное аудио
                             audio_path = tmp_path / f"{video_path.stem}_audio.mp3"
                             if await download_audio_separate(url, audio_path):
                                 audio_caption = f"🎧 <b>Аудио из Instagram</b>\n👤 {escape_html(entries[0].get('author', '')[:50])}"
@@ -368,9 +324,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await status_msg.delete()
                     return
                 
-                # Обычное медиа (видео, фото, аудио)
+                # Обычное медиа
                 media_type = media_info['type']
-                platform = get_platform_name(url)
+                platform = urlparse(url).netloc.lower().replace('www.', '').split('.')[0].capitalize()
                 media_type_rus = {'video': 'видео', 'image': 'фото', 'audio': 'аудио'}.get(media_type, 'медиа')
                 
                 await status_msg.edit_text(f"⏳ Скачиваю {media_type_rus}...")
@@ -386,17 +342,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         output_file = tmp_path / f"{safe_title}.mp4"
                     
-                    success = await download_media_ytdlp(url, output_file, media_type)
-                    if not success:
+                    if not await download_media_ytdlp(url, output_file, media_type):
                         await status_msg.edit_text(f"❌ Не удалось скачать {media_type_rus}")
                         return
                     
                     caption = format_caption(media_info, platform, media_type_rus)
                     await send_media(update, output_file, caption, media_type)
                     
-                    # Для видео отдельно отправляем аудио
                     if media_type == 'video':
-                        await status_msg.edit_text("🎵 Извлекаю аудиодорожку...")
+                        await status_msg.edit_text("🎵 Извлекаю аудио...")
                         audio_file = tmp_path / f"{safe_title}_audio.mp3"
                         if await download_audio_separate(url, audio_file):
                             audio_caption = f"🎧 <b>Аудио из видео</b>\n👤 {escape_html(media_info.get('author', '')[:50])}"
@@ -415,12 +369,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await update.message.reply_text(error_msg)
 
-# ============ ОЧИСТКА ============
-
 async def cleanup_old_files():
     while True:
         try:
             if DOWNLOADS_DIR.exists():
+                import time
                 now = time.time()
                 for f in DOWNLOADS_DIR.iterdir():
                     if f.is_file() and now - f.stat().st_mtime > CLEANUP_INTERVAL:
@@ -429,27 +382,16 @@ async def cleanup_old_files():
             logger.error(f"Cleanup error: {e}")
         await asyncio.sleep(CLEANUP_INTERVAL)
 
-# ============ ЗАПУСК ============
-
 def main():
-    if not is_ytdlp_available():
-        print("\n" + "="*50)
-        print("⚠️  ВНИМАНИЕ: yt-dlp не установлен!")
-        print("Установите: pip install yt-dlp")
-        print("="*50 + "\n")
-        return
-    
-    print("\n" + "="*50)
-    print("🤖 Бот Druid запущен (упрощённая версия)")
-    print(f"✅ Токен: {TOKEN[:10]}...{TOKEN[-5:]}")
-    print(f"✅ yt-dlp: установлен")
-    print(f"✅ TikTok: через yt-dlp (стабильно)")
-    print(f"✅ Instagram: поддержка каруселей")
-    print(f"✅ SoundCloud: аудио в MP3")
-    print(f"✅ Без ffmpeg (не требуется)")
-    print(f"✅ Без разделения файлов (>50 МБ не отправить)")
-    print(f"✅ Одновременных загрузок: {MAX_CONCURRENT_DOWNLOADS}")
-    print("="*50 + "\n")
+    # Тихая проверка при запуске
+    if not check_ytdlp():
+        print("\n⚠️  yt-dlp не установлен. Бот будет работать только с ссылками, которые не требуют yt-dlp.")
+        print("   Установите: pip install yt-dlp\n")
+    else:
+        print("\n✅ Druid Bot запущен")
+        print(f"   Токен: {TOKEN[:10]}...{TOKEN[-5:]}")
+        print(f"   yt-dlp: установлен")
+        print(f"   Одновременных загрузок: {MAX_CONCURRENT_DOWNLOADS}\n")
     
     request = HTTPXRequest(connect_timeout=30, read_timeout=120, write_timeout=120, pool_timeout=30)
     application = Application.builder().token(TOKEN).request(request).build()
@@ -459,8 +401,11 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.create_task(cleanup_old_files())
+    
     try:
         application.run_polling(drop_pending_updates=True)
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен")
     except Exception as e:
         print(f"❌ Ошибка: {e}")
     finally:
