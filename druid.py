@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid (полностью рабочий)
+Telegram бот Druid (полностью рабочий) + интеграция с музыкой (Shazam, поиск, плейлисты)
 """
 
 import re
@@ -13,8 +13,13 @@ from urllib.parse import urlparse
 
 import aiohttp
 from telegram import Update, InputMediaPhoto
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.ext import (
+    Application, MessageHandler, filters, ContextTypes, CommandHandler,
+    CallbackQueryHandler
+)
 from telegram.error import BadRequest
+
+import music   # Новый модуль для музыки, поиска и плейлистов
 
 TOKEN = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
 MAX_FILE_SIZE = 50 * 1024 * 1024
@@ -448,6 +453,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.delete()
                 return
 
+            if "shazam.com" in text:
+                await music.handle_shazam_url(update, context, text, session)
+                await status_msg.delete()
+                return
+
             await handle_generic(update, text, status_msg)
             await status_msg.delete()
 
@@ -470,7 +480,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• TikTok (фото-карусели и видео)\n"
         "• SoundCloud (аудио с названием трека)\n"
         "• Instagram (фото, видео, карусели)\n"
+        "• Shazam (ссылка на трек)\n"
         "• YouTube и другие\n\n"
+        "🎵 <b>Музыкальные команды:</b>\n"
+        "/search <название> – поиск и скачивание трека\n"
+        "/playlist – показать ваш плейлист\n"
+        "/addtoplaylist – добавить последний скачанный трек в плейлист\n"
+        "/play <номер> – прослушать трек из плейлиста\n"
+        "/removefromplaylist <номер> – удалить трек\n\n"
         f"📦 Максимальный размер файла: {MAX_FILE_SIZE//(1024*1024)} МБ\n"
         "📎 Большие файлы автоматически разделяются на части\n"
         "🎵 Аудио сохраняется с оригинальным названием",
@@ -483,6 +500,15 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Регистрируем команды из модуля music
+    app.add_handler(CommandHandler("search", music.search_command))
+    app.add_handler(CommandHandler("playlist", music.playlist_command))
+    app.add_handler(CommandHandler("addtoplaylist", music.add_to_playlist_command))
+    app.add_handler(CommandHandler("removefromplaylist", music.remove_from_playlist_command))
+    app.add_handler(CommandHandler("play", music.play_from_playlist))
+    app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
+    
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
