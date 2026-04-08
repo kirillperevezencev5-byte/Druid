@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid (без ffmpeg)
+Telegram бот Druid (без ffmpeg) — исправленная версия с кнопками добавления в плейлист
 """
 
 import re
@@ -12,7 +12,6 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
-# ОТКЛЮЧАЕМ ЛОГИ
 logging.basicConfig(level=logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
@@ -56,6 +55,16 @@ def escape_html(text: str) -> str:
     if not text: return ""
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
+def format_duration(duration) -> str:
+    """Безопасное форматирование длительности из int или float"""
+    if not duration:
+        return "?"
+    try:
+        dur = int(float(duration))
+        return f"{dur//60}:{dur%60:02d}"
+    except (ValueError, TypeError):
+        return "?"
+
 def format_caption(info: dict, platform: str, media_type: str) -> str:
     emoji = {"video": "🎬", "photo": "📸", "carousel": "🖼️", "audio": "🎵"}.get(media_type, "📎")
     parts = [f"{emoji} <b>{escape_html(platform)}</b>\n"]
@@ -64,10 +73,9 @@ def format_caption(info: dict, platform: str, media_type: str) -> str:
     if info.get("title"):
         parts.append(f"📝 <b>Название:</b> {escape_html(info['title'][:200])}\n")
     if info.get("duration"):
-        dur = info['duration']
-        m = int(dur // 60)
-        s = int(dur % 60)
-        parts.append(f"⏱️ <b>Длительность:</b> {m}:{s:02d}\n")
+        dur_str = format_duration(info['duration'])
+        if dur_str != "?":
+            parts.append(f"⏱️ <b>Длительность:</b> {dur_str}\n")
     if info.get("url"):
         parts.append(f"🔗 <b>Ссылка:</b> <a href='{info['url']}'>источник</a>")
     caption = "".join(parts)
@@ -116,7 +124,16 @@ async def send_photo_group(update, photo_paths, caption):
             try: f.close()
             except: pass
 
-async def send_with_split(update, file_path, caption, media_type):
+async def send_with_split(update, context, file_path, caption, media_type, track_info=None):
+    """
+    Отправляет файл, при необходимости разбивая на части.
+    Для аудио добавляет кнопку добавления в плейлист, если передан track_info.
+    """
+    if media_type == 'audio' and track_info:
+        # Используем функцию из music для отправки аудио с кнопкой
+        await music.send_audio_with_add_button(update, context, file_path, caption, track_info)
+        return
+
     if check_file_size(file_path):
         with open(file_path, 'rb') as f:
             if media_type == 'video':
@@ -171,7 +188,7 @@ async def download_tiktok_video(session, url, dest_path):
     except:
         return False
 
-# ---------------------- yt-dlp core (БЕЗ FFMPEG) ----------------------
+# ---------------------- yt-dlp core (БЕЗ FFMPEG, БЕЗ --no-mux) ----------------------
 async def ytdlp_info(url):
     cmd = ['yt-dlp', '--dump-json', '--no-warnings', '--quiet', url]
     try:
@@ -189,21 +206,15 @@ async def ytdlp_info(url):
 
 async def ytdlp_download(url, output_path, format_spec):
     """
-    Скачивание БЕЗ ffmpeg. 
-    Формат указывается с ограничением: только прямые протоколы (не m3u8)
+    Скачивание БЕЗ ffmpeg. Просто указываем нужный формат.
     """
-    # Базовые параметры для отключения ffmpeg
     base_cmd = [
         'yt-dlp', '-o', str(output_path),
-        '--no-warnings', '--quiet',
-        '--no-mux',                     # не использовать ffmpeg для склеивания
-        '--ffmpeg-location', '/dev/null'  # отключаем ffmpeg полностью
+        '--no-warnings', '--quiet'
     ]
     if format_spec:
-        # Если передан специфичный формат, используем его
         cmd = base_cmd + ['-f', format_spec]
     else:
-        # По умолчанию для аудио: только форматы без m3u8, предпочтение mp3/m4a
         cmd = base_cmd + ['-f', 'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]']
     cmd.append(url)
     try:
@@ -218,8 +229,8 @@ async def ytdlp_download(url, output_path, format_spec):
     except:
         return None
 
-# ---------------------- SoundCloud (БЕЗ FFMPEG) ----------------------
-async def handle_soundcloud(update, url, status_msg):
+# ---------------------- SoundCloud (с кнопкой плейлиста) ----------------------
+async def handle_soundcloud(update, context, url, status_msg):
     await status_msg.edit_text("🎵 Получаю информацию о треке...")
     
     info = await ytdlp_info(url)
@@ -235,15 +246,20 @@ async def handle_soundcloud(update, url, status_msg):
     
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        output_file = tmp / f"{sanitize_filename(title)}.mp3"
+        output_file = tmp / f"{sanitize_filename(title)}"
         
-        # Принудительно указываем формат без m3u8 и без ffmpeg
         result = await ytdlp_download(url, output_file, 'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]')
         
         if not result or not result.exists():
-            await status_msg.edit_text("❌ Ошибка скачивания аудио (возможно, требуется ffmpeg, но он отключен). Попробуйте другой источник.")
+            await status_msg.edit_text("❌ Ошибка скачивания аудио. Попробуйте другой источник.")
             return False
         
+        track_info = {
+            'title': title,
+            'url': url,
+            'duration': duration,
+            'uploader': uploader
+        }
         caption = format_caption({
             'author': uploader,
             'title': title,
@@ -251,10 +267,10 @@ async def handle_soundcloud(update, url, status_msg):
             'url': url
         }, "SoundCloud", "audio")
         
-        await send_with_split(update, result, caption, 'audio')
+        await send_with_split(update, context, result, caption, 'audio', track_info)
         return True
 
-# ---------------------- Instagram (без изменений, но экранирование) ----------------------
+# ---------------------- Instagram ----------------------
 async def handle_instagram(update, url, status_msg):
     await status_msg.edit_text("📸 Получаю информацию из Instagram...")
     
@@ -305,11 +321,11 @@ async def handle_instagram(update, url, status_msg):
                 if len(photos) > 1:
                     await send_photo_group(update, photos, caption)
                 else:
-                    await send_with_split(update, photos[0], caption, 'photo')
+                    await send_with_split(update, None, photos[0], caption, 'photo')
             
             for v in videos:
                 cap = format_caption({'author': author, 'url': url}, "Instagram", "video")
-                await send_with_split(update, v, cap, 'video')
+                await send_with_split(update, None, v, cap, 'video')
         
         return True
     
@@ -328,7 +344,7 @@ async def handle_instagram(update, url, status_msg):
             result = await ytdlp_download(url, out, 'best')
             if result and result.exists():
                 caption = format_caption({'author': author, 'title': title, 'url': url}, "Instagram", "photo")
-                await send_with_split(update, result, caption, 'photo')
+                await send_with_split(update, None, result, caption, 'photo')
                 return True
                 
     elif is_video:
@@ -339,14 +355,14 @@ async def handle_instagram(update, url, status_msg):
             result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
             if result and result.exists():
                 caption = format_caption({'author': author, 'title': title, 'duration': duration, 'url': url}, "Instagram", "video")
-                await send_with_split(update, result, caption, 'video')
+                await send_with_split(update, None, result, caption, 'video')
                 return True
     
     await status_msg.edit_text("❌ Не удалось обработать Instagram")
     return False
 
-# ---------------------- YouTube / другие (БЕЗ FFMPEG) ----------------------
-async def handle_generic(update, url, status_msg):
+# ---------------------- YouTube / другие (аудио с кнопкой) ----------------------
+async def handle_generic(update, context, url, status_msg):
     await status_msg.edit_text("🔄 Получаю информацию...")
     
     info = await ytdlp_info(url)
@@ -370,7 +386,7 @@ async def handle_generic(update, url, status_msg):
             result = await ytdlp_download(url, out, 'best')
             if result and result.exists():
                 caption = format_caption({'author': author, 'title': title, 'url': url}, platform, "photo")
-                await send_with_split(update, result, caption, 'photo')
+                await send_with_split(update, None, result, caption, 'photo')
                 return True
                 
     elif is_video:
@@ -381,21 +397,26 @@ async def handle_generic(update, url, status_msg):
             result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
             if result and result.exists():
                 caption = format_caption({'author': author, 'title': title, 'duration': duration, 'url': url}, platform, "video")
-                await send_with_split(update, result, caption, 'video')
+                await send_with_split(update, None, result, caption, 'video')
                 return True
     else:
-        await status_msg.edit_text("🎵 Скачиваю аудио (без ffmpeg)...")
+        await status_msg.edit_text("🎵 Скачиваю аудио...")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            out = tmp / f"{sanitize_filename(title)}.mp3"
-            # Аудио без ffmpeg
+            out = tmp / f"{sanitize_filename(title)}"
             result = await ytdlp_download(url, out, 'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]')
             if result and result.exists():
+                track_info = {
+                    'title': title,
+                    'url': url,
+                    'duration': duration,
+                    'uploader': author
+                }
                 caption = format_caption({'author': author, 'title': title, 'duration': duration, 'url': url}, platform, "audio")
-                await send_with_split(update, result, caption, 'audio')
+                await send_with_split(update, context, result, caption, 'audio', track_info)
                 return True
     
-    await status_msg.edit_text("❌ Не удалось обработать ссылку (возможно, требуется ffmpeg, но он отключен)")
+    await status_msg.edit_text("❌ Не удалось обработать ссылку")
     return False
 
 # ---------------------- основной обработчик ----------------------
@@ -409,7 +430,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with aiohttp.ClientSession() as session:
             if "tiktok.com" in text:
-                # ... TikTok (без изменений) ...
                 await status_msg.edit_text("🎵 Обрабатываю TikTok...")
                 data = await get_tiktok_info(session, text)
                 if not data:
@@ -427,7 +447,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         author = data.get('author', {}).get('unique_id', '')
                         caption = format_caption({'author': author, 'title': data.get('title', ''), 'url': text}, "TikTok", "carousel" if len(photos) > 1 else "photo")
                         if len(photos) == 1:
-                            await send_with_split(update, photos[0], caption, 'photo')
+                            await send_with_split(update, None, photos[0], caption, 'photo')
                         else:
                             await send_photo_group(update, photos, caption)
                         await status_msg.delete()
@@ -444,14 +464,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             return
                         author = data.get('author', {}).get('unique_id', '')
                         caption = format_caption({'author': author, 'title': data.get('title', ''), 'duration': data.get('duration'), 'url': text}, "TikTok", "video")
-                        await send_with_split(update, out, caption, 'video')
+                        await send_with_split(update, None, out, caption, 'video')
                         await status_msg.delete()
                     return
                 await status_msg.edit_text("❌ Не найден контент TikTok")
                 return
 
             if "soundcloud.com" in text:
-                await handle_soundcloud(update, text, status_msg)
+                await handle_soundcloud(update, context, text, status_msg)
                 await status_msg.delete()
                 return
 
@@ -465,7 +485,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.delete()
                 return
 
-            await handle_generic(update, text, status_msg)
+            await handle_generic(update, context, text, status_msg)
             await status_msg.delete()
 
     except asyncio.TimeoutError:
@@ -485,37 +505,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Druid Bot</b>\n\n"
         "Отправьте ссылку на видео/аудио/фото с:\n"
         "• TikTok (фото-карусели и видео)\n"
-        "• SoundCloud (аудио с названием трека)\n"
+        "• SoundCloud (аудио с кнопкой добавления в плейлист)\n"
         "• Instagram (фото, видео, карусели)\n"
-        "• Shazam (ссылка на трек)\n"
-        "• YouTube и другие\n\n"
+        "• Shazam (ссылка на трек → поиск на SoundCloud)\n"
+        "• YouTube и другие (аудио с кнопкой)\n\n"
         "🎵 <b>Музыкальные команды:</b>\n"
-        "/search <название> – поиск и скачивание трека\n"
+        "/search <название> – поиск на SoundCloud и скачивание\n"
         "/playlist – показать ваш плейлист\n"
-        "/addtoplaylist – добавить последний скачанный трек в плейлист\n"
+        "/addtoplaylist – добавить последний трек (лучше использовать кнопку)\n"
         "/play <номер> – прослушать трек из плейлиста\n"
         "/removefromplaylist <номер> – удалить трек\n\n"
         f"📦 Максимальный размер файла: {MAX_FILE_SIZE//(1024*1024)} МБ\n"
         "📎 Большие файлы автоматически разделяются на части\n"
         "🎵 Аудио сохраняется с оригинальным названием\n"
-        "⚠️ <i>ffmpeg отключен, поддерживаются только прямые аудиоформаты (mp3, m4a)</i>",
+        "➕ <i>Под каждым аудио есть кнопка добавления в плейлист</i>",
         parse_mode='HTML'
     )
 
 # ---------------------- main ----------------------
 def main():
-    print("🚀 Бот запущен (без ffmpeg). Нажмите Ctrl+C для остановки.")
+    print("🚀 Бот запущен. Нажмите Ctrl+C для остановки.")
     
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
+    # Команды музыки
     app.add_handler(CommandHandler("search", music.search_command))
     app.add_handler(CommandHandler("playlist", music.playlist_command))
     app.add_handler(CommandHandler("addtoplaylist", music.add_to_playlist_command))
     app.add_handler(CommandHandler("removefromplaylist", music.remove_from_playlist_command))
     app.add_handler(CommandHandler("play", music.play_from_playlist))
+    
+    # Callback-обработчики
     app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
+    app.add_handler(CallbackQueryHandler(music.add_track_callback, pattern="^add_track_"))
     
     try:
         app.run_polling(drop_pending_updates=True)
