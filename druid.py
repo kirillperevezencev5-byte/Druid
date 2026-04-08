@@ -100,6 +100,8 @@ async def split_file(file_path: Path):
     return parts
 
 async def send_photo_group(update, photo_paths, caption):
+    if not update.message:
+        return
     files = []
     try:
         media = []
@@ -198,7 +200,7 @@ async def ytdlp_info(url):
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-        if proc.returncode != 0:
+        if proc.returncode != 0 or not stdout:
             return None
         return json.loads(stdout.decode())
     except:
@@ -294,7 +296,7 @@ async def handle_instagram(update, url, status_msg):
                 if not entry_url:
                     continue
                 
-                ext = entry.get('ext', '')
+                ext = entry.get('ext') or ''
                 if ext in ('jpg', 'jpeg', 'png'):
                     out = tmp / f"photo_{idx+1}.jpg"
                     result = await ytdlp_download(entry_url, out, 'best')
@@ -329,7 +331,7 @@ async def handle_instagram(update, url, status_msg):
         
         return True
     
-    ext = info.get('ext', '')
+    ext = info.get('ext') or ''
     is_video = ext in ('mp4', 'webm', 'mov')
     is_image = ext in ('jpg', 'jpeg', 'png', 'webp')
     title = info.get('title', 'media')
@@ -370,7 +372,7 @@ async def handle_generic(update, context, url, status_msg):
         await status_msg.edit_text("❌ Не удалось получить информацию")
         return False
     
-    ext = info.get('ext', '')
+    ext = info.get('ext') or ''
     is_video = ext in ('mp4', 'webm', 'mov')
     is_image = ext in ('jpg', 'jpeg', 'png', 'webp')
     title = info.get('title', 'media')
@@ -450,7 +452,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await send_with_split(update, None, photos[0], caption, 'photo')
                         else:
                             await send_photo_group(update, photos, caption)
-                        await status_msg.delete()
+                        try:
+                            await status_msg.delete()
+                        except:
+                            pass
                     return
                 video = data.get("play")
                 if video:
@@ -465,28 +470,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         author = data.get('author', {}).get('unique_id', '')
                         caption = format_caption({'author': author, 'title': data.get('title', ''), 'duration': data.get('duration'), 'url': text}, "TikTok", "video")
                         await send_with_split(update, None, out, caption, 'video')
-                        await status_msg.delete()
+                        try:
+                            await status_msg.delete()
+                        except:
+                            pass
                     return
                 await status_msg.edit_text("❌ Не найден контент TikTok")
                 return
 
             if "soundcloud.com" in text:
                 await handle_soundcloud(update, context, text, status_msg)
-                await status_msg.delete()
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
                 return
 
             if "instagram.com" in text:
                 await handle_instagram(update, text, status_msg)
-                await status_msg.delete()
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
                 return
 
             if "shazam.com" in text:
                 await music.handle_shazam_url(update, context, text, session)
-                await status_msg.delete()
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
                 return
 
             await handle_generic(update, context, text, status_msg)
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except:
+                pass
 
     except asyncio.TimeoutError:
         try:

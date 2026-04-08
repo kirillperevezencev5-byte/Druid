@@ -89,7 +89,7 @@ async def search_tracks_soundcloud(query: str, max_results=5):
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-        if proc.returncode != 0:
+        if proc.returncode != 0 or not stdout:
             return []
         results = []
         for line in stdout.decode().strip().split('\n'):
@@ -138,13 +138,19 @@ PLAYLISTS_FILE = Path("playlists.json")
 
 def load_playlists():
     if PLAYLISTS_FILE.exists():
-        with open(PLAYLISTS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(PLAYLISTS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
     return {}
 
 def save_playlists(data):
-    with open(PLAYLISTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        with open(PLAYLISTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except:
+        pass
 
 async def add_to_playlist(user_id: int, track_info: dict):
     playlists = load_playlists()
@@ -182,6 +188,9 @@ async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFA
     else:
         # Это CallbackQuery
         target = update_or_query.message
+    
+    if not target:
+        return
     
     # Генерируем уникальный ID для этого трека
     track_id = secrets.token_hex(8)
@@ -300,7 +309,11 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if not data.startswith("select_track_"):
         return
-    idx = int(data.split("_")[-1])
+    try:
+        idx = int(data.split("_")[-1])
+    except:
+        await query.edit_message_text("❌ Ошибка: неверный формат.")
+        return
     results = context.user_data.get('search_results', [])
     if idx >= len(results):
         await query.edit_message_text("❌ Ошибка: вариант не найден.")
@@ -322,7 +335,11 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
         }
         caption = f"🎵 <b>{escape_html(selected['title'][:100])}</b>"
         await send_audio_with_add_button(query, context, result, caption, selected)
-        await query.message.delete()
+        if query.message:
+            try:
+                await query.message.delete()
+            except:
+                pass
 
 async def add_track_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатия кнопки 'Добавить в плейлист'"""
@@ -332,8 +349,8 @@ async def add_track_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not data.startswith("add_track_"):
         return
     track_id = data.split("_", 2)[2]
-    temp_tracks = context.user_data.get('temp_tracks', {})
-    track_info = temp_tracks.get(track_id)
+    temp_tracks = context.user_data.get('temp_tracks')
+    track_info = temp_tracks.get(track_id) if temp_tracks else None
     if not track_info:
         await query.edit_message_text("❌ Информация о треке устарела. Попробуйте скачать заново.")
         return
@@ -344,9 +361,12 @@ async def add_track_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await query.edit_message_text("⚠️ Трек уже есть в вашем плейлисте.")
     # Удаляем временные данные
-    temp_tracks.pop(track_id, None)
+    if temp_tracks:
+        temp_tracks.pop(track_id, None)
 
 async def handle_shazam_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, session):
+    if not update.message:
+        return
     status_msg = await update.message.reply_text("🔍 Анализирую Shazam...")
     shazam_info = await get_shazam_track_info(session, url)
     if not shazam_info:
