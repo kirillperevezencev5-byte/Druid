@@ -1,0 +1,9 @@
+aiohttp==3.9.3
+beautifulsoup4==4.12.3
+python-telegram-bot==20.7
+yt-dlp==2024.4.9
+certifi>=2024.2.2
+charset-normalizer>=3.3.2
+idna>=3.6
+multidict>=6.0.5
+yarl>=1.9.4
