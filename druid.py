@@ -8,8 +8,17 @@ import re
 import json
 import asyncio
 import tempfile
+import logging
 from pathlib import Path
 from urllib.parse import urlparse
+
+# ОТКЛЮЧАЕМ ВСЕ ЛОГИ И СПАМ В КОНСОЛИ
+logging.basicConfig(level=logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+logging.getLogger("telegram").setLevel(logging.ERROR)
+logging.getLogger("telegram.ext").setLevel(logging.ERROR)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
 
 import aiohttp
 from telegram import Update, InputMediaPhoto
@@ -17,9 +26,9 @@ from telegram.ext import (
     Application, MessageHandler, filters, ContextTypes, CommandHandler,
     CallbackQueryHandler
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 
-import music   # Новый модуль для музыки, поиска и плейлистов
+import music
 
 TOKEN = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
 MAX_FILE_SIZE = 50 * 1024 * 1024
@@ -496,12 +505,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------------- main ----------------------
 def main():
-    print("🚀 Бот запущен...")
+    # Только одно сообщение при запуске
+    print("🚀 Бот запущен. Нажмите Ctrl+C для остановки.")
+    
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Регистрируем команды из модуля music
     app.add_handler(CommandHandler("search", music.search_command))
     app.add_handler(CommandHandler("playlist", music.playlist_command))
     app.add_handler(CommandHandler("addtoplaylist", music.add_to_playlist_command))
@@ -509,7 +519,14 @@ def main():
     app.add_handler(CommandHandler("play", music.play_from_playlist))
     app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
     
-    app.run_polling(drop_pending_updates=True)
+    # Запускаем с подавлением ошибок сети
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except NetworkError:
+        # Просто игнорируем ошибки сети, не спамим в консоль
+        pass
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен.")
 
 if __name__ == "__main__":
     main()
