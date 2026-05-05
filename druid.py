@@ -1,38 +1,63 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid (без ffmpeg) — исправленная версия с кнопками добавления в плейлист
+Telegram бот Druid (без ffmpeg) — обновлённый:
+- Логирование активности в SQLite
+- Команда /users (админы)
+- Плейлисты в SQLite
+- Улучшенная обработка кнопок
+- Корректное управление временными файлами
 """
 
-import re
-import json
 import asyncio
-import tempfile
+import json
 import logging
+import re
+import shutil
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
-
-logging.basicConfig(level=logging.ERROR)
-logging.getLogger("httpx").setLevel(logging.ERROR)
-logging.getLogger("httpcore").setLevel(logging.ERROR)
-logging.getLogger("telegram").setLevel(logging.ERROR)
 
 import aiohttp
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     Application, MessageHandler, filters, ContextTypes, CommandHandler,
-    CallbackQueryHandler
+    CallbackQueryHandler, BaseMiddleware
 )
 from telegram.error import BadRequest, NetworkError
 
 import music
+import database
 
+# ---------- Настройки ----------
 TOKEN = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_MEDIA_GROUP = 10
 API_TIMEOUT = 30
+ADMIN_IDS = {123456789}  # Замените на реальные ID администраторов
 
-# ---------------------- helpers ----------------------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.WARNING
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Middleware для логирования активности ----------
+class ActivityMiddleware(BaseMiddleware):
+    async def process_update(self, update, context):
+        if update.message and update.message.from_user:
+            user = update.message.from_user
+            chat_id = update.message.chat_id
+            if chat_id > 0 or chat_id < 0:
+                await database.log_user_activity(
+                    user.id,
+                    user.first_name or "",
+                    user.username or "",
+                    chat_id
+                )
+        return await super().process_update(update, context)
+
+# ---------- Вспомогательные функции ----------
 def sanitize_filename(title: str) -> str:
     title = re.sub(r'[\\/*?:"<>|]', "", title)
     if len(title) > 80:
@@ -52,11 +77,11 @@ def get_platform(url: str) -> str:
     return domain.replace('www.', '').split('.')[0].capitalize()
 
 def escape_html(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def format_duration(duration) -> str:
-    """Безопасное форматирование длительности из int или float"""
     if not duration:
         return "?"
     try:
@@ -119,43 +144,65 @@ async def send_photo_group(update, photo_paths, caption):
             try:
                 with open(path, 'rb') as f:
                     await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
-            except Exception:
+            except:
                 pass
     finally:
         for f in files:
-            try: f.close()
-            except: pass
+            try:
+                f.close()
+            except:
+                pass
 
 async def send_with_split(update, context, file_path, caption, media_type, track_info=None):
     """
     Отправляет файл, при необходимости разбивая на части.
-    Для аудио добавляет кнопку добавления в плейлист, если передан track_info.
+    Для аудио вызывает специальную функцию с кнопкой.
     """
     if media_type == 'audio' and track_info:
-        # Используем функцию из music для отправки аудио с кнопкой
         await music.send_audio_with_add_button(update, context, file_path, caption, track_info)
         return
 
     if check_file_size(file_path):
         with open(file_path, 'rb') as f:
             if media_type == 'video':
-                await update.message.reply_video(video=f, caption=caption, parse_mode='HTML', supports_streaming=True)
+                await update.message.reply_video(
+                    video=f, caption=caption, parse_mode='HTML',
+                    supports_streaming=True
+                )
             elif media_type == 'audio':
-                await update.message.reply_audio(audio=f, caption=caption, parse_mode='HTML')
+                await update.message.reply_audio(
+                    audio=f, caption=caption, parse_mode='HTML'
+                )
             elif media_type == 'photo':
-                await update.message.reply_photo(photo=f, caption=caption, parse_mode='HTML')
+                await update.message.reply_photo(
+                    photo=f, caption=caption, parse_mode='HTML'
+                )
             else:
-                await update.message.reply_document(document=f, caption=caption, parse_mode='HTML')
+                await update.message.reply_document(
+                    document=f, caption=caption, parse_mode='HTML'
+                )
         return
+
     parts = await split_file(file_path)
     for i, part in enumerate(parts):
         with open(part, 'rb') as f:
-            await update.message.reply_document(document=f, caption=f"{caption}\n📦 Часть {i+1}/{len(parts)}")
+            await update.message.reply_document(
+                document=f,
+                caption=f"{caption}\n📦 Часть {i + 1}/{len(parts)}"
+            )
+        try:
+            part.unlink(missing_ok=True)
+        except:
+            pass
 
-# ---------------------- TikTok (API) ----------------------
+# ---------- TikTok (API) ----------
 async def get_tiktok_info(session, url):
     try:
-        async with session.get("https://tikwm.com/api/", params={"url": url}, timeout=API_TIMEOUT) as r:
+        async with session.get(
+            "https://tikwm.com/api/",
+            params={"url": url},
+            timeout=API_TIMEOUT
+        ) as r:
             if r.status != 200:
                 return None
             data = await r.json()
@@ -190,13 +237,13 @@ async def download_tiktok_video(session, url, dest_path):
     except:
         return False
 
-# ---------------------- yt-dlp core (БЕЗ FFMPEG, БЕЗ --no-mux) ----------------------
+# ---------- yt-dlp core (БЕЗ FFMPEG) ----------
 async def ytdlp_info(url):
     cmd = ['yt-dlp', '--dump-json', '--no-warnings', '--quiet', url]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, 
-            stdout=asyncio.subprocess.PIPE, 
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
@@ -217,7 +264,10 @@ async def ytdlp_download(url, output_path, format_spec):
     if format_spec:
         cmd = base_cmd + ['-f', format_spec]
     else:
-        cmd = base_cmd + ['-f', 'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]']
+        cmd = base_cmd + [
+            '-f',
+            'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]'
+        ]
     cmd.append(url)
     try:
         proc = await asyncio.create_subprocess_exec(*cmd)
@@ -231,147 +281,150 @@ async def ytdlp_download(url, output_path, format_spec):
     except:
         return None
 
-# ---------------------- SoundCloud (с кнопкой плейлиста) ----------------------
-async def handle_soundcloud(update, context, url, status_msg):
+# ---------- SoundCloud (с кнопкой плейлиста) ----------
+async def handle_soundcloud(update, context, url, status_msg, tmpdir):
     await status_msg.edit_text("🎵 Получаю информацию о треке...")
-    
+
     info = await ytdlp_info(url)
     if not info:
         await status_msg.edit_text("❌ Не удалось получить информацию с SoundCloud")
         return False
-    
+
     title = info.get('title', 'audio')
     uploader = info.get('uploader', '')
     duration = info.get('duration', 0)
-    
-    await status_msg.edit_text(f"🎵 Скачиваю: {escape_html(title[:50])}...")
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        output_file = tmp / f"{sanitize_filename(title)}"
-        
-        result = await ytdlp_download(url, output_file, 'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]')
-        
-        if not result or not result.exists():
-            await status_msg.edit_text("❌ Ошибка скачивания аудио. Попробуйте другой источник.")
-            return False
-        
-        track_info = {
-            'title': title,
-            'url': url,
-            'duration': duration,
-            'uploader': uploader
-        }
-        caption = format_caption({
-            'author': uploader,
-            'title': title,
-            'duration': duration,
-            'url': url
-        }, "SoundCloud", "audio")
-        
-        await send_with_split(update, context, result, caption, 'audio', track_info)
-        return True
 
-# ---------------------- Instagram ----------------------
-async def handle_instagram(update, url, status_msg):
+    await status_msg.edit_text(f"🎵 Скачиваю: {escape_html(title[:50])}...")
+
+    tmp = Path(tmpdir)
+    output_file = tmp / f"{sanitize_filename(title)}"
+
+    result = await ytdlp_download(
+        url, output_file,
+        'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]'
+    )
+
+    if not result or not result.exists():
+        await status_msg.edit_text("❌ Ошибка скачивания аудио. Попробуйте другой источник.")
+        return False
+
+    track_info = {
+        'title': title,
+        'url': url,
+        'duration': duration,
+        'uploader': uploader
+    }
+    caption = format_caption({
+        'author': uploader,
+        'title': title,
+        'duration': duration,
+        'url': url
+    }, "SoundCloud", "audio")
+
+    await send_with_split(update, context, result, caption, 'audio', track_info)
+    return True
+
+# ---------- Instagram ----------
+async def handle_instagram(update, context, url, status_msg, tmpdir):
     await status_msg.edit_text("📸 Получаю информацию из Instagram...")
-    
+
     info = await ytdlp_info(url)
     if not info:
         await status_msg.edit_text("❌ Не удалось получить данные Instagram")
         return False
-    
+
+    tmp = Path(tmpdir)
+
     if info.get('_type') == 'playlist' and 'entries' in info:
         entries = info['entries']
         await status_msg.edit_text(f"🖼️ Обнаружена карусель из {len(entries)} элементов. Скачиваю...")
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            downloaded = []
-            
-            for idx, entry in enumerate(entries):
-                if not entry:
-                    continue
-                entry_url = entry.get('webpage_url') or entry.get('url')
-                if not entry_url:
-                    continue
-                
-                ext = entry.get('ext') or ''
-                if ext in ('jpg', 'jpeg', 'png'):
-                    out = tmp / f"photo_{idx+1}.jpg"
-                    result = await ytdlp_download(entry_url, out, 'best')
-                elif ext in ('mp4', 'mov'):
-                    out = tmp / f"video_{idx+1}.mp4"
-                    result = await ytdlp_download(entry_url, out, 'best[height<=720][ext=mp4]')
-                else:
-                    continue
-                    
-                if result and result.exists():
-                    downloaded.append(result)
-            
-            if not downloaded:
-                await status_msg.edit_text("❌ Не удалось скачать карусель")
-                return False
-            
-            photos = [f for f in downloaded if f.suffix in ('.jpg', '.jpeg', '.png')]
-            videos = [f for f in downloaded if f.suffix == '.mp4']
-            
-            author = info.get('uploader', '')
-            
-            if photos:
-                caption = format_caption({'author': author, 'url': url}, "Instagram", "carousel")
-                if len(photos) > 1:
-                    await send_photo_group(update, photos, caption)
-                else:
-                    await send_with_split(update, None, photos[0], caption, 'photo')
-            
-            for v in videos:
-                cap = format_caption({'author': author, 'url': url}, "Instagram", "video")
-                await send_with_split(update, None, v, cap, 'video')
-        
+
+        downloaded = []
+
+        for idx, entry in enumerate(entries):
+            if not entry:
+                continue
+            entry_url = entry.get('webpage_url') or entry.get('url')
+            if not entry_url:
+                continue
+
+            ext = entry.get('ext') or ''
+            if ext in ('jpg', 'jpeg', 'png'):
+                out = tmp / f"photo_{idx + 1}.jpg"
+                result = await ytdlp_download(entry_url, out, 'best')
+            elif ext in ('mp4', 'mov'):
+                out = tmp / f"video_{idx + 1}.mp4"
+                result = await ytdlp_download(entry_url, out, 'best[height<=720][ext=mp4]')
+            else:
+                continue
+
+            if result and result.exists():
+                downloaded.append(result)
+
+        if not downloaded:
+            await status_msg.edit_text("❌ Не удалось скачать карусель")
+            return False
+
+        photos = [f for f in downloaded if f.suffix in ('.jpg', '.jpeg', '.png')]
+        videos = [f for f in downloaded if f.suffix == '.mp4']
+
+        author = info.get('uploader', '')
+
+        if photos:
+            caption = format_caption({'author': author, 'url': url}, "Instagram", "carousel")
+            if len(photos) > 1:
+                await send_photo_group(update, photos, caption)
+            else:
+                await send_with_split(update, context, photos[0], caption, 'photo')
+
+        for v in videos:
+            cap = format_caption({'author': author, 'url': url}, "Instagram", "video")
+            await send_with_split(update, context, v, cap, 'video')
+
         return True
-    
+
     ext = info.get('ext') or ''
     is_video = ext in ('mp4', 'webm', 'mov')
     is_image = ext in ('jpg', 'jpeg', 'png', 'webp')
     title = info.get('title', 'media')
     author = info.get('uploader', '')
     duration = info.get('duration', 0)
-    
+
     if is_image:
         await status_msg.edit_text("📸 Скачиваю фото...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            out = tmp / f"{sanitize_filename(title)}.jpg"
-            result = await ytdlp_download(url, out, 'best')
-            if result and result.exists():
-                caption = format_caption({'author': author, 'title': title, 'url': url}, "Instagram", "photo")
-                await send_with_split(update, None, result, caption, 'photo')
-                return True
-                
+        out = tmp / f"{sanitize_filename(title)}.jpg"
+        result = await ytdlp_download(url, out, 'best')
+        if result and result.exists():
+            caption = format_caption(
+                {'author': author, 'title': title, 'url': url}, "Instagram", "photo"
+            )
+            await send_with_split(update, context, result, caption, 'photo')
+            return True
+
     elif is_video:
         await status_msg.edit_text("🎬 Скачиваю видео...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            out = tmp / f"{sanitize_filename(title)}.mp4"
-            result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
-            if result and result.exists():
-                caption = format_caption({'author': author, 'title': title, 'duration': duration, 'url': url}, "Instagram", "video")
-                await send_with_split(update, None, result, caption, 'video')
-                return True
-    
+        out = tmp / f"{sanitize_filename(title)}.mp4"
+        result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
+        if result and result.exists():
+            caption = format_caption(
+                {'author': author, 'title': title, 'duration': duration, 'url': url},
+                "Instagram", "video"
+            )
+            await send_with_split(update, context, result, caption, 'video')
+            return True
+
     await status_msg.edit_text("❌ Не удалось обработать Instagram")
     return False
 
-# ---------------------- YouTube / другие (аудио с кнопкой) ----------------------
-async def handle_generic(update, context, url, status_msg):
+# ---------- YouTube / другие (аудио с кнопкой) ----------
+async def handle_generic(update, context, url, status_msg, tmpdir):
     await status_msg.edit_text("🔄 Получаю информацию...")
-    
+
     info = await ytdlp_info(url)
     if not info:
         await status_msg.edit_text("❌ Не удалось получить информацию")
         return False
-    
+
     ext = info.get('ext') or ''
     is_video = ext in ('mp4', 'webm', 'mov')
     is_image = ext in ('jpg', 'jpeg', 'png', 'webp')
@@ -379,121 +432,141 @@ async def handle_generic(update, context, url, status_msg):
     author = info.get('uploader', '')
     duration = info.get('duration', 0)
     platform = get_platform(url)
-    
+
+    tmp = Path(tmpdir)
+
     if is_image:
         await status_msg.edit_text("📸 Скачиваю фото...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            out = tmp / f"{sanitize_filename(title)}.jpg"
-            result = await ytdlp_download(url, out, 'best')
-            if result and result.exists():
-                caption = format_caption({'author': author, 'title': title, 'url': url}, platform, "photo")
-                await send_with_split(update, None, result, caption, 'photo')
-                return True
-                
+        out = tmp / f"{sanitize_filename(title)}.jpg"
+        result = await ytdlp_download(url, out, 'best')
+        if result and result.exists():
+            caption = format_caption(
+                {'author': author, 'title': title, 'url': url}, platform, "photo"
+            )
+            await send_with_split(update, context, result, caption, 'photo')
+            return True
+
     elif is_video:
         await status_msg.edit_text("🎬 Скачиваю видео...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            out = tmp / f"{sanitize_filename(title)}.mp4"
-            result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
-            if result and result.exists():
-                caption = format_caption({'author': author, 'title': title, 'duration': duration, 'url': url}, platform, "video")
-                await send_with_split(update, None, result, caption, 'video')
-                return True
+        out = tmp / f"{sanitize_filename(title)}.mp4"
+        result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
+        if result and result.exists():
+            caption = format_caption(
+                {'author': author, 'title': title, 'duration': duration, 'url': url},
+                platform, "video"
+            )
+            await send_with_split(update, context, result, caption, 'video')
+            return True
     else:
         await status_msg.edit_text("🎵 Скачиваю аудио...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            out = tmp / f"{sanitize_filename(title)}"
-            result = await ytdlp_download(url, out, 'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]')
-            if result and result.exists():
-                track_info = {
-                    'title': title,
-                    'url': url,
-                    'duration': duration,
-                    'uploader': author
-                }
-                caption = format_caption({'author': author, 'title': title, 'duration': duration, 'url': url}, platform, "audio")
-                await send_with_split(update, context, result, caption, 'audio', track_info)
-                return True
-    
+        out = tmp / f"{sanitize_filename(title)}"
+        result = await ytdlp_download(
+            url, out,
+            'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]'
+        )
+        if result and result.exists():
+            track_info = {
+                'title': title,
+                'url': url,
+                'duration': duration,
+                'uploader': author
+            }
+            caption = format_caption(
+                {'author': author, 'title': title, 'duration': duration, 'url': url},
+                platform, "audio"
+            )
+            await send_with_split(update, context, result, caption, 'audio', track_info)
+            return True
+
     await status_msg.edit_text("❌ Не удалось обработать ссылку")
     return False
 
-# ---------------------- основной обработчик ----------------------
+# ---------- Основной обработчик ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not is_url(text):
         return
 
     status_msg = await update.message.reply_text("⏳ Обрабатываю ссылку...")
-    
+
+    tmpdir = tempfile.mkdtemp()
+
     try:
         async with aiohttp.ClientSession() as session:
+            # TikTok
             if "tiktok.com" in text:
                 await status_msg.edit_text("🎵 Обрабатываю TikTok...")
                 data = await get_tiktok_info(session, text)
                 if not data:
                     await status_msg.edit_text("❌ Не удалось получить данные TikTok")
                     return
+
                 images = data.get("images") or []
                 if images:
                     await status_msg.edit_text(f"📸 Скачиваю {len(images)} фото...")
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        tmp = Path(tmpdir)
-                        photos = await download_tiktok_photos(session, images, tmp)
-                        if not photos:
-                            await status_msg.edit_text("❌ Не удалось скачать фото")
-                            return
-                        author = data.get('author', {}).get('unique_id', '')
-                        caption = format_caption({'author': author, 'title': data.get('title', ''), 'url': text}, "TikTok", "carousel" if len(photos) > 1 else "photo")
-                        if len(photos) == 1:
-                            await send_with_split(update, None, photos[0], caption, 'photo')
-                        else:
-                            await send_photo_group(update, photos, caption)
-                        try:
-                            await status_msg.delete()
-                        except:
-                            pass
+                    photos = await download_tiktok_photos(session, images, Path(tmpdir))
+                    if not photos:
+                        await status_msg.edit_text("❌ Не удалось скачать фото")
+                        return
+                    author = data.get('author', {}).get('unique_id', '')
+                    caption = format_caption(
+                        {'author': author, 'title': data.get('title', ''), 'url': text},
+                        "TikTok",
+                        "carousel" if len(photos) > 1 else "photo"
+                    )
+                    if len(photos) == 1:
+                        await send_with_split(update, context, photos[0], caption, 'photo')
+                    else:
+                        await send_photo_group(update, photos, caption)
+                    try:
+                        await status_msg.delete()
+                    except:
+                        pass
                     return
+
                 video = data.get("play")
                 if video:
                     await status_msg.edit_text("🎬 Скачиваю видео...")
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        tmp = Path(tmpdir)
-                        out = tmp / "video.mp4"
-                        ok = await download_tiktok_video(session, video, out)
-                        if not ok:
-                            await status_msg.edit_text("❌ Не удалось скачать видео")
-                            return
-                        author = data.get('author', {}).get('unique_id', '')
-                        caption = format_caption({'author': author, 'title': data.get('title', ''), 'duration': data.get('duration'), 'url': text}, "TikTok", "video")
-                        await send_with_split(update, None, out, caption, 'video')
-                        try:
-                            await status_msg.delete()
-                        except:
-                            pass
+                    out = Path(tmpdir) / "video.mp4"
+                    ok = await download_tiktok_video(session, video, out)
+                    if not ok:
+                        await status_msg.edit_text("❌ Не удалось скачать видео")
+                        return
+                    author = data.get('author', {}).get('unique_id', '')
+                    caption = format_caption(
+                        {'author': author, 'title': data.get('title', ''),
+                         'duration': data.get('duration'), 'url': text},
+                        "TikTok", "video"
+                    )
+                    await send_with_split(update, context, out, caption, 'video')
+                    try:
+                        await status_msg.delete()
+                    except:
+                        pass
                     return
+
                 await status_msg.edit_text("❌ Не найден контент TikTok")
                 return
 
+            # SoundCloud
             if "soundcloud.com" in text:
-                await handle_soundcloud(update, context, text, status_msg)
+                await handle_soundcloud(update, context, text, status_msg, tmpdir)
                 try:
                     await status_msg.delete()
                 except:
                     pass
                 return
 
+            # Instagram
             if "instagram.com" in text:
-                await handle_instagram(update, text, status_msg)
+                await handle_instagram(update, context, text, status_msg, tmpdir)
                 try:
                     await status_msg.delete()
                 except:
                     pass
                 return
 
+            # Shazam
             if "shazam.com" in text:
                 await music.handle_shazam_url(update, context, text, session)
                 try:
@@ -502,7 +575,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
                 return
 
-            await handle_generic(update, context, text, status_msg)
+            # Generic (YouTube и другие)
+            await handle_generic(update, context, text, status_msg, tmpdir)
             try:
                 await status_msg.delete()
             except:
@@ -514,12 +588,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     except Exception as e:
+        logger.exception("Unhandled error in handle_message")
         try:
-            await status_msg.edit_text(f"❌ Ошибка: {escape_html(str(e)[:100])}")
+            await status_msg.edit_text("❌ Произошла ошибка, попробуйте позже")
         except:
             pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ---------------------- start ----------------------
+# ---------- /users ----------
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+
+    users = await database.get_all_users()
+    if not users:
+        await update.message.reply_text("Нет данных о пользователях.")
+        return
+
+    text = "👥 <b>Пользователи бота</b>\n\n"
+    for u in users:
+        uid = u['user_id']
+        name = escape_html(u['first_name'] or "no_name")
+        username = u['username'] or "—"
+        last = u['last_activity'] or "?"
+        groups_raw = u['groups']
+        groups_str = ""
+        if groups_raw:
+            try:
+                groups_list = json.loads(groups_raw) if isinstance(groups_raw, str) else groups_raw
+                if groups_list:
+                    groups_str = ", ".join(str(g) for g in groups_list[:5])
+                    groups_str = f" (группы: {groups_str})"
+            except:
+                pass
+        text += f"• <code>{uid}</code> {name} @{username}\n  Последняя активность: {last}{groups_str}\n"
+        if len(text) > 3800:
+            text += "... (показаны первые, полный список в логах)"
+            break
+
+    await update.message.reply_text(text, parse_mode='HTML')
+
+# ---------- /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 <b>Druid Bot</b>\n\n"
@@ -535,36 +647,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addtoplaylist – добавить последний трек (лучше использовать кнопку)\n"
         "/play <номер> – прослушать трек из плейлиста\n"
         "/removefromplaylist <номер> – удалить трек\n\n"
-        f"📦 Максимальный размер файла: {MAX_FILE_SIZE//(1024*1024)} МБ\n"
+        f"📦 Максимальный размер файла: {MAX_FILE_SIZE // (1024 * 1024)} МБ\n"
         "📎 Большие файлы автоматически разделяются на части\n"
         "🎵 Аудио сохраняется с оригинальным названием\n"
         "➕ <i>Под каждым аудио есть кнопка добавления в плейлист</i>",
         parse_mode='HTML'
     )
 
-# ---------------------- main ----------------------
+# ---------- main ----------
 def main():
     print("🚀 Бот запущен. Нажмите Ctrl+C для остановки.")
-    
+
+    asyncio.run(database.init_db())
+
     app = Application.builder().token(TOKEN).build()
+    app.add_middleware(ActivityMiddleware())
+
+    # Основные команды
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("users", users_command))
+
+    # Обработчик ссылок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Команды музыки
+
+    # Музыкальные команды
     app.add_handler(CommandHandler("search", music.search_command))
     app.add_handler(CommandHandler("playlist", music.playlist_command))
     app.add_handler(CommandHandler("addtoplaylist", music.add_to_playlist_command))
     app.add_handler(CommandHandler("removefromplaylist", music.remove_from_playlist_command))
     app.add_handler(CommandHandler("play", music.play_from_playlist))
-    
+
     # Callback-обработчики
     app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
     app.add_handler(CallbackQueryHandler(music.add_track_callback, pattern="^add_track_"))
-    
+
     try:
         app.run_polling(drop_pending_updates=True)
     except NetworkError:
-        pass
+        logger.warning("NetworkError in polling loop")
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен.")
 
