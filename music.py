@@ -9,6 +9,7 @@ import re
 import json
 import asyncio
 import tempfile
+import shutil
 import secrets
 from pathlib import Path
 
@@ -148,6 +149,9 @@ async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFA
         context.user_data['temp_tracks'] = {}
     context.user_data['temp_tracks'][track_id] = track_info
 
+    # Сохраняем также как last_track для команды /addtoplaylist
+    context.user_data['last_track'] = track_info
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить в плейлист", callback_data=f"add_track_{track_id}")]
     ])
@@ -165,10 +169,9 @@ async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFA
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = ' '.join(context.args).strip()
     if not query:
-        query = context.user_data.get('pending_shazam_query', '')
-        if not query:
-            await update.message.reply_text("ℹ️ Используйте: /search <название трека>")
-            return
+        await update.message.reply_text("ℹ️ Используйте: /search <название трека>")
+        return
+
     status_msg = await update.message.reply_text(f"🔎 Ищу на SoundCloud: {escape_html(query[:100])}...")
     results = await search_tracks_soundcloud(query, max_results=5)
     if not results:
@@ -248,8 +251,13 @@ async def play_from_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE)
         caption = f"🎵 <b>{escape_html(track['title'][:100])}</b>\n📌 Из плейлиста"
         await send_audio_with_add_button(update, context, result, caption, track)
         await status_msg.delete()
+    except Exception as e:
+        logging.getLogger(__name__).exception("Error in play_from_playlist")
+        try:
+            await status_msg.edit_text("❌ Произошла ошибка при воспроизведении.")
+        except:
+            pass
     finally:
-        import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -294,7 +302,6 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
             except:
                 pass
     finally:
-        import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
     # Очищаем временные данные поиска
     context.user_data.pop('search_results', None)

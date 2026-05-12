@@ -7,8 +7,10 @@ Telegram бот Druid (без ffmpeg) — обновлённый:
 - Плейлисты в SQLite
 - Улучшенная обработка кнопок
 - Корректное управление временными файлами
+- Токен и ID админов через переменные окружения
 """
 
+import os
 import asyncio
 import json
 import logging
@@ -19,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
+from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     Application, MessageHandler, filters, ContextTypes, CommandHandler,
@@ -29,12 +32,25 @@ from telegram.error import BadRequest, NetworkError
 import music
 import database
 
+# ---------- Загрузка переменных окружения ----------
+load_dotenv()
+
 # ---------- Настройки ----------
-TOKEN = "8783056247:AAHGJF9vtDwuoCQBwfhdYOqQgFRsgfGAAp4"
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ Не задан BOT_TOKEN в переменных окружения или .env файле")
+
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_MEDIA_GROUP = 10
 API_TIMEOUT = 30
-ADMIN_IDS = {123456789}  # Замените на реальные ID администраторов
+
+# ID администраторов через запятую: ADMIN_IDS=123456789,987654321
+admin_ids_str = os.environ.get("ADMIN_IDS", "")
+ADMIN_IDS = set()
+for uid in admin_ids_str.split(","):
+    uid = uid.strip()
+    if uid.isdigit():
+        ADMIN_IDS.add(int(uid))
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -650,7 +666,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Максимальный размер файла: {MAX_FILE_SIZE // (1024 * 1024)} МБ\n"
         "📎 Большие файлы автоматически разделяются на части\n"
         "🎵 Аудио сохраняется с оригинальным названием\n"
-        "➕ <i>Под каждым аудио есть кнопка добавления в плейлист</i>",
+        "➕ <i>Под каждым аудио есть кнопка добавления в плейлист</i>\n\n"
+        "⚠️ <i>Для скачивания MP3 с YouTube может потребоваться ffmpeg</i>",
         parse_mode='HTML'
     )
 
