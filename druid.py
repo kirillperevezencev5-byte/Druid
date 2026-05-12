@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     Application, MessageHandler, filters, ContextTypes, CommandHandler,
-    CallbackQueryHandler, BaseMiddleware
+    CallbackQueryHandler
 )
 from telegram.error import BadRequest, NetworkError
 
@@ -57,21 +57,6 @@ logging.basicConfig(
     level=logging.WARNING
 )
 logger = logging.getLogger(__name__)
-
-# ---------- Middleware для логирования активности ----------
-class ActivityMiddleware(BaseMiddleware):
-    async def process_update(self, update, context):
-        if update.message and update.message.from_user:
-            user = update.message.from_user
-            chat_id = update.message.chat_id
-            if chat_id > 0 or chat_id < 0:
-                await database.log_user_activity(
-                    user.id,
-                    user.first_name or "",
-                    user.username or "",
-                    chat_id
-                )
-        return await super().process_update(update, context)
 
 # ---------- Вспомогательные функции ----------
 def sanitize_filename(title: str) -> str:
@@ -497,9 +482,24 @@ async def handle_generic(update, context, url, status_msg, tmpdir):
     await status_msg.edit_text("❌ Не удалось обработать ссылку")
     return False
 
-# ---------- Основной обработчик ----------
+# ---------- Основной обработчик с логированием активности ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    
+    # Логирование активности
+    if update.message.from_user:
+        user = update.message.from_user
+        chat_id = update.message.chat_id
+        try:
+            await database.log_user_activity(
+                user.id,
+                user.first_name or "",
+                user.username or "",
+                chat_id
+            )
+        except Exception as e:
+            logger.error(f"Ошибка логирования: {e}")
+    
     if not is_url(text):
         return
 
@@ -673,12 +673,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- main ----------
 def main():
+    """Точка входа"""
     print("🚀 Бот запущен. Нажмите Ctrl+C для остановки.")
 
+    # Инициализируем базу данных
     asyncio.run(database.init_db())
 
+    # Создаём приложение
     app = Application.builder().token(TOKEN).build()
-    app.add_middleware(ActivityMiddleware())
 
     # Основные команды
     app.add_handler(CommandHandler("start", start))
@@ -699,11 +701,13 @@ def main():
     app.add_handler(CallbackQueryHandler(music.add_track_callback, pattern="^add_track_"))
 
     try:
+        # run_polling сам управляет event loop
         app.run_polling(drop_pending_updates=True)
     except NetworkError:
         logger.warning("NetworkError in polling loop")
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен.")
+
 
 if __name__ == "__main__":
     main()
