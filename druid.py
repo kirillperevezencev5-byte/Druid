@@ -730,15 +730,25 @@ async def main():
     app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
     app.add_handler(CallbackQueryHandler(music.add_track_callback, pattern="^add_track_"))
     
+    # Запуск с правильной обработкой остановки
     try:
-        # Запускаем бота
+        # Используем run_polling без дополнительного event loop
         await app.run_polling(drop_pending_updates=True)
-    except KeyboardInterrupt:
+    except asyncio.CancelledError:
         print("\n👋 Бот остановлен.")
-    except NetworkError as e:
-        logger.error(f"NetworkError: {e}")
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен вручную.")
     except Exception as e:
         logger.exception(f"Неожиданная ошибка: {e}")
 
+# В самом низу файла ЗАМЕНИТЕ эту часть:
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен")
+    except RuntimeError as e:
+        if "Cannot close a running event loop" in str(e):
+            print("Бот завершил работу")
+        else:
+            raise
