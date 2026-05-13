@@ -49,11 +49,27 @@ def format_duration(duration) -> str:
 def get_user_track_path(user_id: int, track_title: str, ext: str = ".mp3") -> Path:
     """Генерирует путь для сохранения трека пользователя"""
     safe_title = sanitize_filename(track_title)
-    # Ограничиваем длину имени файла
     if len(safe_title) > 100:
         safe_title = safe_title[:100]
     filename = f"{user_id}_{safe_title}{ext}"
     return database.CACHE_DIR / filename
+
+# ---------- Вспомогательная функция для разрешения коротких ссылок SoundCloud ----------
+async def resolve_soundcloud_url(short_url: str, session: aiohttp.ClientSession) -> str:
+    """
+    Преобразует короткую ссылку SoundCloud (on.soundcloud.com) в полную.
+    """
+    if "on.soundcloud.com" not in short_url:
+        return short_url
+    
+    try:
+        async with session.get(short_url, allow_redirects=True, timeout=10) as resp:
+            final_url = str(resp.url)
+            logger.info(f"Resolved SoundCloud URL: {short_url} -> {final_url}")
+            return final_url
+    except Exception as e:
+        logger.error(f"Failed to resolve SoundCloud URL: {e}")
+        return short_url
 
 # ---------- Shazam ----------
 async def get_shazam_track_info(session, url: str):
@@ -131,11 +147,15 @@ async def search_tracks_soundcloud(query: str, max_results=5):
         return []
 
 # ---------- Скачивание аудио ----------
-async def download_audio_from_url(url: str, output_path: Path) -> Optional[Path]:
+async def download_audio_from_url(url: str, output_path: Path, session: aiohttp.ClientSession = None) -> Optional[Path]:
     """
-    Скачивание аудио в форматах, поддерживаемых Telegram:
-    m4a, ogg, mp3, opus (webm исключён)
+    Скачивание аудио в форматах, поддерживаемых Telegram.
+    Если передан session, то короткие ссылки SoundCloud будут разрешены.
     """
+    # Разрешаем короткие ссылки SoundCloud
+    if session and "on.soundcloud.com" in url:
+        url = await resolve_soundcloud_url(url, session)
+    
     base_path = output_path.parent / output_path.stem
     
     # Приоритет форматов: m4a -> ogg -> mp3 -> opus -> aac
@@ -221,12 +241,10 @@ async def download_audio_from_url(url: str, output_path: Path) -> Optional[Path]
         return None
 
 # ---------- Сохранение трека в кэш ----------
-async def download_and_cache_track(url: str, user_id: int, track_info: dict) -> Optional[Dict[str, Any]]:
+async def download_and_cache_track(url: str, user_id: int, track_info: dict, session: aiohttp.ClientSession = None) -> Optional[Dict[str, Any]]:
     """
     Скачивает трек, сохраняет в кэш пользователя и возвращает информацию о файле.
-    Если файл уже существует, возвращает его.
     """
-    # Определяем расширение (пока mp3, потом можно определить из скачанного файла)
     ext = ".mp3"
     out_path = get_user_track_path(user_id, track_info['title'], ext)
     
@@ -243,7 +261,7 @@ async def download_and_cache_track(url: str, user_id: int, track_info: dict) -> 
     tmpdir = tempfile.mkdtemp()
     try:
         tmp_out = Path(tmpdir) / f"{sanitize_filename(track_info['title'])}"
-        downloaded = await download_audio_from_url(url, tmp_out)
+        downloaded = await download_audio_from_url(url, tmp_out, session)
         
         if not downloaded or not downloaded.exists():
             logger.error(f"Failed to download track: {track_info.get('title')}")
@@ -422,7 +440,9 @@ async def playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             # Пробуем восстановить
-            cached = await download_and_cache_track(track['url'], user_id, track)
+            async with aiohttp.ClientSession() as session:
+                cached = await download_and_cache_track(track['url'], user_id, track, session)
+            
             if cached and cached['path'].exists():
                 file_path = cached['path']
                 # Обновляем путь в БД
@@ -481,7 +501,8 @@ async def add_to_playlist_command(update: Update, context: ContextTypes.DEFAULT_
     status_msg = await update.message.reply_text(f"💾 Сохраняю: {escape_html(last_track['title'][:50])}...")
     
     # Скачиваем и кэшируем трек
-    cached = await download_and_cache_track(last_track['url'], user_id, last_track)
+    async with aiohttp.ClientSession() as session:
+        cached = await download_and_cache_track(last_track['url'], user_id, last_track, session)
     
     if not cached:
         await status_msg.edit_text("❌ Не удалось сохранить трек. Попробуйте позже.")
@@ -536,7 +557,10 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
     tmpdir = tempfile.mkdtemp()
     try:
         out = Path(tmpdir) / f"{sanitize_filename(selected['title'])}"
-        result = await download_audio_from_url(selected['url'], out)
+        
+        # Создаём сессию для разрешения ссылок
+        async with aiohttp.ClientSession() as session:
+            result = await download_audio_from_url(selected['url'], out, session)
         
         if not result or not result.exists():
             logger.error(f"Download failed for selected track: {selected.get('title')}")
@@ -607,7 +631,8 @@ async def add_track_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     status_msg = await query.message.reply_text(f"💾 Сохраняю в плейлист: {escape_html(track_info['title'][:50])}...")
     
     # Скачиваем и кэшируем трек
-    cached = await download_and_cache_track(track_info['url'], user_id, track_info)
+    async with aiohttp.ClientSession() as session:
+        cached = await download_and_cache_track(track_info['url'], user_id, track_info, session)
     
     if not cached:
         await status_msg.edit_text("❌ Не удалось сохранить трек. Попробуйте позже.")
