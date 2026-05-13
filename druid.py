@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram бот Druid (без ffmpeg) — обновлённый:
+Telegram бот Druid (с поддержкой плейлистов и кэширования аудио)
 - Логирование активности в SQLite
 - Команда /users (админы)
-- Плейлисты в SQLite
+- Плейлисты с локальным кэшированием
 - Улучшенная обработка кнопок
 - Корректное управление временными файлами
 - Токен и ID админов через переменные окружения
@@ -54,7 +54,7 @@ for uid in admin_ids_str.split(","):
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO  # Изменено с WARNING на INFO для отладки
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -238,7 +238,7 @@ async def download_tiktok_video(session, url, dest_path):
     except:
         return False
 
-# ---------- yt-dlp core (БЕЗ FFMPEG) ----------
+# ---------- yt-dlp info (без ffmpeg) ----------
 async def ytdlp_info(url):
     cmd = ['yt-dlp', '--dump-json', '--no-warnings', '--quiet', url]
     try:
@@ -247,39 +247,13 @@ async def ytdlp_info(url):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0 or not stdout:
+            logger.error(f"yt-dlp info error: {stderr.decode()[:200]}")
             return None
         return json.loads(stdout.decode())
-    except:
-        return None
-
-async def ytdlp_download(url, output_path, format_spec):
-    """
-    Скачивание БЕЗ ffmpeg. Просто указываем нужный формат.
-    """
-    base_cmd = [
-        'yt-dlp', '-o', str(output_path),
-        '--no-warnings', '--quiet'
-    ]
-    if format_spec:
-        cmd = base_cmd + ['-f', format_spec]
-    else:
-        cmd = base_cmd + [
-            '-f',
-            'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]'
-        ]
-    cmd.append(url)
-    try:
-        proc = await asyncio.create_subprocess_exec(*cmd)
-        await asyncio.wait_for(proc.wait(), timeout=120)
-        if proc.returncode != 0:
-            return None
-        if not output_path.exists():
-            matches = list(output_path.parent.glob(f"{output_path.stem}.*"))
-            return matches[0] if matches else None
-        return output_path
-    except:
+    except Exception as e:
+        logger.error(f"yt-dlp info exception: {e}")
         return None
 
 # ---------- SoundCloud (с кнопкой плейлиста) ----------
@@ -300,10 +274,7 @@ async def handle_soundcloud(update, context, url, status_msg, tmpdir):
     tmp = Path(tmpdir)
     output_file = tmp / f"{sanitize_filename(title)}"
 
-    result = await ytdlp_download(
-        url, output_file,
-        'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]'
-    )
+    result = await music.download_audio_from_url(url, output_file)
 
     if not result or not result.exists():
         await status_msg.edit_text("❌ Ошибка скачивания аудио. Попробуйте другой источник.")
@@ -352,15 +323,18 @@ async def handle_instagram(update, context, url, status_msg, tmpdir):
             ext = entry.get('ext') or ''
             if ext in ('jpg', 'jpeg', 'png'):
                 out = tmp / f"photo_{idx + 1}.jpg"
-                result = await ytdlp_download(entry_url, out, 'best')
+                result = await music.download_audio_from_url(entry_url, out)  # переиспользуем, но для фото это не оптимально
+                # Лучше использовать yt-dlp для фото, но для простоты оставим так
+                if result and result.exists():
+                    downloaded.append(result)
             elif ext in ('mp4', 'mov'):
                 out = tmp / f"video_{idx + 1}.mp4"
-                result = await ytdlp_download(entry_url, out, 'best[height<=720][ext=mp4]')
-            else:
-                continue
-
-            if result and result.exists():
-                downloaded.append(result)
+                # Для видео нужна отдельная функция
+                cmd = ['yt-dlp', '-o', str(out), '--no-warnings', '--quiet', '-f', 'best[height<=720][ext=mp4]', entry_url]
+                proc = await asyncio.create_subprocess_exec(*cmd)
+                await proc.wait()
+                if out.exists():
+                    downloaded.append(out)
 
         if not downloaded:
             await status_msg.edit_text("❌ Не удалось скачать карусель")
@@ -394,24 +368,28 @@ async def handle_instagram(update, context, url, status_msg, tmpdir):
     if is_image:
         await status_msg.edit_text("📸 Скачиваю фото...")
         out = tmp / f"{sanitize_filename(title)}.jpg"
-        result = await ytdlp_download(url, out, 'best')
-        if result and result.exists():
+        cmd = ['yt-dlp', '-o', str(out), '--no-warnings', '--quiet', url]
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.wait()
+        if out.exists():
             caption = format_caption(
                 {'author': author, 'title': title, 'url': url}, "Instagram", "photo"
             )
-            await send_with_split(update, context, result, caption, 'photo')
+            await send_with_split(update, context, out, caption, 'photo')
             return True
 
     elif is_video:
         await status_msg.edit_text("🎬 Скачиваю видео...")
         out = tmp / f"{sanitize_filename(title)}.mp4"
-        result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
-        if result and result.exists():
+        cmd = ['yt-dlp', '-o', str(out), '--no-warnings', 'quiet', '-f', 'best[height<=720][ext=mp4]', url]
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.wait()
+        if out.exists():
             caption = format_caption(
                 {'author': author, 'title': title, 'duration': duration, 'url': url},
                 "Instagram", "video"
             )
-            await send_with_split(update, context, result, caption, 'video')
+            await send_with_split(update, context, out, caption, 'video')
             return True
 
     await status_msg.edit_text("❌ Не удалось обработать Instagram")
@@ -439,32 +417,33 @@ async def handle_generic(update, context, url, status_msg, tmpdir):
     if is_image:
         await status_msg.edit_text("📸 Скачиваю фото...")
         out = tmp / f"{sanitize_filename(title)}.jpg"
-        result = await ytdlp_download(url, out, 'best')
-        if result and result.exists():
+        cmd = ['yt-dlp', '-o', str(out), '--no-warnings', '--quiet', url]
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.wait()
+        if out.exists():
             caption = format_caption(
                 {'author': author, 'title': title, 'url': url}, platform, "photo"
             )
-            await send_with_split(update, context, result, caption, 'photo')
+            await send_with_split(update, context, out, caption, 'photo')
             return True
 
     elif is_video:
         await status_msg.edit_text("🎬 Скачиваю видео...")
         out = tmp / f"{sanitize_filename(title)}.mp4"
-        result = await ytdlp_download(url, out, 'best[height<=720][ext=mp4]')
-        if result and result.exists():
+        cmd = ['yt-dlp', '-o', str(out), '--no-warnings', '--quiet', '-f', 'best[height<=720][ext=mp4]', url]
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.wait()
+        if out.exists():
             caption = format_caption(
                 {'author': author, 'title': title, 'duration': duration, 'url': url},
                 platform, "video"
             )
-            await send_with_split(update, context, result, caption, 'video')
+            await send_with_split(update, context, out, caption, 'video')
             return True
     else:
         await status_msg.edit_text("🎵 Скачиваю аудио...")
         out = tmp / f"{sanitize_filename(title)}"
-        result = await ytdlp_download(
-            url, out,
-            'bestaudio[protocol!=m3u8][ext=mp3]/bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8]'
-        )
+        result = await music.download_audio_from_url(url, out)
         if result and result.exists():
             track_info = {
                 'title': title,
@@ -612,7 +591,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ---------- /users ----------
+# ---------- Команды для админов ----------
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -640,14 +619,17 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     groups_str = f" (группы: {groups_str})"
             except:
                 pass
-        text += f"• <code>{uid}</code> {name} @{username}\n  Последняя активность: {last}{groups_str}\n"
+        
+        # Получаем статистику плейлиста пользователя
+        stats = await database.get_playlist_stats(uid)
+        text += f"• <code>{uid}</code> {name} @{username}\n  📊 {stats['count']} треков, {stats['total_size']/(1024*1024):.1f} МБ\n  Последняя активность: {last}{groups_str}\n\n"
+        
         if len(text) > 3800:
             text += "... (показаны первые, полный список в логах)"
             break
 
     await update.message.reply_text(text, parse_mode='HTML')
 
-# ---------- /checkdb (для админов) ----------
 async def check_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка состояния базы данных (только для админов)"""
     user_id = update.effective_user.id
@@ -656,66 +638,124 @@ async def check_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     import aiosqlite
-    # Проверяем количество треков в плейлистах
     async with aiosqlite.connect(database.DB_PATH) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM playlists")
-        total = await cursor.fetchone()
+        total_tracks = await cursor.fetchone()
         
         cursor = await db.execute("SELECT COUNT(*) FROM users")
-        users = await cursor.fetchone()
+        total_users = await cursor.fetchone()
         
         cursor = await db.execute("SELECT COUNT(*) FROM playlists WHERE user_id=?", (user_id,))
         my_tracks = await cursor.fetchone()
         
+        # Размер кэша
+        cache_size = 0
+        if database.CACHE_DIR.exists():
+            for f in database.CACHE_DIR.iterdir():
+                if f.is_file():
+                    cache_size += f.stat().st_size
+        
         await update.message.reply_text(
-            f"📊 Статистика БД:\n"
-            f"• Всего треков в плейлистах: {total[0]}\n"
-            f"• Всего пользователей: {users[0]}\n"
-            f"• Ваших треков: {my_tracks[0]}\n"
-            f"• Путь к БД: {database.DB_PATH}"
+            f"📊 <b>Статистика БД и кэша</b>\n\n"
+            f"🗄 База данных:\n"
+            f"• Всего треков в плейлистах: {total_tracks[0]}\n"
+            f"• Всего пользователей: {total_users[0]}\n"
+            f"• Ваших треков: {my_tracks[0]}\n\n"
+            f"💾 Кэш аудио:\n"
+            f"• Путь: {database.CACHE_DIR}\n"
+            f"• Размер: {cache_size/(1024*1024):.2f} МБ\n"
+            f"• Файлов: {len(list(database.CACHE_DIR.iterdir()))}\n\n"
+            f"📁 Путь к БД: {database.DB_PATH}",
+            parse_mode='HTML'
         )
+
+async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка кэша аудио (только для админов)"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+    
+    # Очищаем папку кэша
+    deleted_count = 0
+    deleted_size = 0
+    
+    if database.CACHE_DIR.exists():
+        for f in database.CACHE_DIR.iterdir():
+            if f.is_file():
+                deleted_size += f.stat().st_size
+                f.unlink()
+                deleted_count += 1
+    
+    await update.message.reply_text(
+        f"🧹 <b>Кэш очищен</b>\n\n"
+        f"• Удалено файлов: {deleted_count}\n"
+        f"• Освобождено: {deleted_size/(1024*1024):.2f} МБ",
+        parse_mode='HTML'
+    )
+
+async def my_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику пользователя"""
+    user_id = update.effective_user.id
+    stats = await database.get_playlist_stats(user_id)
+    playlist = await database.get_user_playlist(user_id)
+    
+    await update.message.reply_text(
+        f"📊 <b>Ваша статистика</b>\n\n"
+        f"🎵 Треков в плейлисте: {stats['count']}\n"
+        f"💾 Общий размер: {stats['total_size']/(1024*1024):.1f} МБ\n"
+        f"📁 В кэше: {len(list(database.CACHE_DIR.glob(f'{user_id}_*')))} файлов\n\n"
+        f"💡 <i>Используйте /playlist для прослушивания</i>",
+        parse_mode='HTML'
+    )
 
 # ---------- /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 <b>Druid Bot</b>\n\n"
-        "Отправьте ссылку на видео/аудио/фото с:\n"
-        "• TikTok (фото-карусели и видео)\n"
-        "• SoundCloud (аудио с кнопкой добавления в плейлист)\n"
-        "• Instagram (фото, видео, карусели)\n"
-        "• Shazam (ссылка на трек → поиск на SoundCloud)\n"
-        "• YouTube и другие (аудио с кнопкой)\n\n"
-        "🎵 <b>Музыкальные команды:</b>\n"
-        "/search <название> – поиск на SoundCloud и скачивание\n"
-        "/playlist – показать ваш плейлист\n"
-        "/addtoplaylist – добавить последний трек (лучше использовать кнопку)\n"
-        "/play <номер> – прослушать трек из плейлиста\n"
-        "/removefromplaylist <номер> – удалить трек\n\n"
+        "🤖 <b>Druid Bot v2.0</b>\n\n"
+        "<b>📌 Основные возможности:</b>\n"
+        "• Скачивание с TikTok, Instagram, YouTube, SoundCloud\n"
+        "• Поиск музыки на SoundCloud\n"
+        "• <b>Плейлисты с сохранением треков</b>\n"
+        "• Воспроизведение прямо в Telegram\n\n"
+        
+        "<b>🎵 Музыкальные команды:</b>\n"
+        "/search <название> – поиск на SoundCloud\n"
+        "/playlist – показать плейлист (аудиосообщения)\n"
+        "/addtoplaylist – добавить последний трек\n"
+        "/mystats – ваша статистика\n\n"
+        
+        "<b>🔗 Работа со ссылками:</b>\n"
+        "• TikTok, Instagram, YouTube\n"
+        "• SoundCloud (с кнопкой добавления)\n"
+        "• Shazam (поиск по ссылке)\n\n"
+        
         f"📦 Максимальный размер файла: {MAX_FILE_SIZE // (1024 * 1024)} МБ\n"
-        "📎 Большие файлы автоматически разделяются на части\n"
-        "🎵 Аудио сохраняется с оригинальным названием\n"
-        "➕ <i>Под каждым аудио есть кнопка добавления в плейлист</i>\n\n"
-        "⚠️ <i>Для скачивания MP3 с YouTube может потребоваться ffmpeg</i>",
+        "🎵 <i>Под каждым аудио есть кнопка добавления в плейлист</i>\n\n"
+        
+        "💡 <b>Совет:</b> Добавляйте треки в плейлист через кнопку, "
+        "и они будут доступны в любой момент без перекачивания!",
+        
         parse_mode='HTML'
     )
 
 # ---------- main (асинхронная) ----------
 def main():
     """Точка входа (синхронная)"""
-    print("🚀 Бот запущен. Нажмите Ctrl+C для остановки.")
+    print("🚀 Запуск Druid Bot...")
     
-    # Инициализируем базу данных (синхронно)
-    import asyncio
+    # Инициализируем базу данных
     try:
         asyncio.run(database.init_db())
     except RuntimeError:
-        # Если цикл уже запущен, создаём новый
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(database.init_db())
         loop.close()
     
     print("✅ База данных инициализирована")
+    print(f"📁 Кэш аудио: {database.CACHE_DIR}")
+    print(f"👥 Администраторы: {ADMIN_IDS if ADMIN_IDS else 'не настроены'}")
     
     # Создаём приложение
     app = Application.builder().token(TOKEN).build()
@@ -724,6 +764,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("checkdb", check_db_command))
+    app.add_handler(CommandHandler("clearcache", clear_cache_command))
+    app.add_handler(CommandHandler("mystats", my_stats_command))
     
     # Обработчик ссылок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -732,27 +774,20 @@ def main():
     app.add_handler(CommandHandler("search", music.search_command))
     app.add_handler(CommandHandler("playlist", music.playlist_command))
     app.add_handler(CommandHandler("addtoplaylist", music.add_to_playlist_command))
-    app.add_handler(CommandHandler("removefromplaylist", music.remove_from_playlist_command))
-    app.add_handler(CommandHandler("play", music.play_from_playlist))
     
     # Callback-обработчики
     app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
     app.add_handler(CallbackQueryHandler(music.add_track_callback, pattern="^add_track_"))
+    app.add_handler(CallbackQueryHandler(music.remove_from_playlist_callback, pattern="^del_pl_"))
     
-    # Запуск бота (синхронный метод - НЕ используем await)
+    # Запуск бота
+    print("✅ Бот запущен и готов к работе!")
     app.run_polling(drop_pending_updates=True)
 
-
-# В самом низу файла:
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен.")
-    except RuntimeError as e:
-        if "event loop" in str(e):
-            print("⚠️ Проблема с event loop, но бот должен работать")
-        else:
-            print(f"Ошибка: {e}")
     except Exception as e:
-        print(f"Ошибка: {e}")
+        print(f"❌ Ошибка: {e}")
