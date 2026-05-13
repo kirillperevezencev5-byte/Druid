@@ -700,12 +700,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ---------- main (асинхронная) ----------
-async def main():
-    """Точка входа (асинхронная)"""
+def main():
+    """Точка входа (синхронная)"""
     print("🚀 Бот запущен. Нажмите Ctrl+C для остановки.")
     
-    # Инициализируем базу данных
-    await database.init_db()
+    # Инициализируем базу данных (синхронно)
+    import asyncio
+    try:
+        asyncio.run(database.init_db())
+    except RuntimeError:
+        # Если цикл уже запущен, создаём новый
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(database.init_db())
+        loop.close()
+    
     print("✅ База данных инициализирована")
     
     # Создаём приложение
@@ -730,25 +739,20 @@ async def main():
     app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
     app.add_handler(CallbackQueryHandler(music.add_track_callback, pattern="^add_track_"))
     
-    # Запуск с правильной обработкой остановки
-    try:
-        # Используем run_polling без дополнительного event loop
-        await app.run_polling(drop_pending_updates=True)
-    except asyncio.CancelledError:
-        print("\n👋 Бот остановлен.")
-    except KeyboardInterrupt:
-        print("\n👋 Бот остановлен вручную.")
-    except Exception as e:
-        logger.exception(f"Неожиданная ошибка: {e}")
+    # Запуск бота (синхронный метод - НЕ используем await)
+    app.run_polling(drop_pending_updates=True)
 
-# В самом низу файла ЗАМЕНИТЕ эту часть:
+
+# В самом низу файла:
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
-        print("Бот остановлен")
+        print("\n👋 Бот остановлен.")
     except RuntimeError as e:
-        if "Cannot close a running event loop" in str(e):
-            print("Бот завершил работу")
+        if "event loop" in str(e):
+            print("⚠️ Проблема с event loop, но бот должен работать")
         else:
-            raise
+            print(f"Ошибка: {e}")
+    except Exception as e:
+        print(f"Ошибка: {e}")

@@ -215,7 +215,7 @@ async def playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = escape_html(track.get('title', 'Без названия')[:60])
         dur_str = format_duration(track.get('duration'))
         text += f"{i+1}. {title} [{dur_str}]\n"
-    text += "\nИспользуйте /play <номер> или /removefromplaylist <номер>"
+    text += "\nИспользуйте /play &lt;номер&gt; или /removefromplaylist &lt;номер&gt;"
     await update.message.reply_text(text, parse_mode='HTML')
 
 async def add_to_playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
