@@ -95,7 +95,8 @@ async def search_tracks_soundcloud(query: str, max_results=5):
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0 or not stdout:
-            logger.error(f"yt-dlp search error: {stderr.decode()}")
+            stderr_decoded = stderr.decode() if stderr else ''
+            logger.error(f"yt-dlp search error (code {proc.returncode}): {stderr_decoded[:200]}")
             return []
         results = []
         for line in stdout.decode().strip().split('\n'):
@@ -113,35 +114,104 @@ async def search_tracks_soundcloud(query: str, max_results=5):
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decode error: {e}")
                 continue
+        logger.info(f"Search for '{query}' returned {len(results)} results")
         return results[:max_results]
     except Exception as e:
         logger.error(f"Search error: {e}")
         return []
 
 async def download_audio_from_url(url: str, output_path: Path):
+    """
+    Скачивание аудио в форматах, поддерживаемых Telegram:
+    m4a, ogg, mp3, opus (webm исключён)
+    """
     base_path = output_path.parent / output_path.stem
+    
+    # Приоритет форматов: m4a -> ogg -> mp3 -> opus -> любой другой (кроме webm и m3u8)
+    format_spec = (
+        'bestaudio[protocol!=m3u8][ext=m4a]/'
+        'bestaudio[protocol!=m3u8][ext=ogg]/'
+        'bestaudio[protocol!=m3u8][ext=mp3]/'
+        'bestaudio[protocol!=m3u8][ext=opus]/'
+        'bestaudio[protocol!=m3u8][ext=aac]/'
+        'bestaudio[protocol!=m3u8]'
+    )
+    
     cmd = [
         'yt-dlp',
         '-o', str(base_path),
         '--no-warnings',
         '--quiet',
-        '--format',
-        'bestaudio[protocol!=m3u8][ext=m4a]/bestaudio[protocol!=m3u8][ext=webm]/bestaudio[protocol!=m3u8][ext=opus]/bestaudio[protocol!=m3u8][ext=mp3]',
+        '--format', format_spec,
         url
     ]
+    
     try:
+        logger.info(f"Downloading audio from {url[:100]}...")
         proc = await asyncio.create_subprocess_exec(*cmd)
         await asyncio.wait_for(proc.wait(), timeout=120)
+        
         if proc.returncode != 0:
             logger.error(f"Download failed with code {proc.returncode}")
             return None
+        
+        # Ищем скачанный файл
         matches = list(output_path.parent.glob(f"{base_path.stem}.*"))
-        return matches[0] if matches else None
+        if not matches:
+            logger.error(f"No file found for {base_path.stem}")
+            return None
+        
+        downloaded_path = matches[0]
+        
+        # Проверка: если скачался webm - пробуем с другим форматом
+        if downloaded_path.suffix.lower() == '.webm':
+            logger.warning(f"Downloaded webm format, trying alternative...")
+            
+            # Альтернативный формат без webm
+            alt_format_spec = (
+                'bestaudio[protocol!=m3u8][ext=m4a]/'
+                'bestaudio[protocol!=m3u8][ext=ogg]/'
+                'bestaudio[protocol!=m3u8][ext=mp3]/'
+                'bestaudio[protocol!=m3u8][ext=opus]'
+            )
+            
+            cmd_alt = [
+                'yt-dlp',
+                '-o', str(base_path),
+                '--no-warnings',
+                '--quiet',
+                '--format', alt_format_spec,
+                url
+            ]
+            
+            proc_alt = await asyncio.create_subprocess_exec(*cmd_alt)
+            await asyncio.wait_for(proc_alt.wait(), timeout=120)
+            
+            if proc_alt.returncode == 0:
+                matches_alt = list(output_path.parent.glob(f"{base_path.stem}.*"))
+                if matches_alt and matches_alt[0].suffix.lower() != '.webm':
+                    downloaded_path = matches_alt[0]
+                    logger.info(f"Alternative download successful: {downloaded_path}")
+                else:
+                    logger.error("Alternative download failed or still webm")
+                    return None
+            else:
+                logger.error("Alternative download failed")
+                return None
+        
+        logger.info(f"Download successful: {downloaded_path} ({downloaded_path.stat().st_size} bytes)")
+        return downloaded_path
+        
+    except asyncio.TimeoutError:
+        logger.error(f"Download timeout for {url[:100]}")
+        return None
     except Exception as e:
         logger.error(f"Download error: {e}")
         return None
 
 # ---------- Отправка аудио с кнопкой "Добавить в плейлист" ----------
+SUPPORTED_AUDIO_EXT = {'.mp3', '.m4a', '.ogg', '.opus', '.wav', '.flac', '.aac'}
+
 async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFAULT_TYPE,
                                       audio_path: Path, caption: str, track_info: dict):
     """Отправляет аудио с кнопкой и временным токеном для callback"""
@@ -153,6 +223,22 @@ async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFA
     if not target:
         logger.error("No target for send_audio_with_add_button")
         return
+
+    # Проверка поддерживаемого расширения
+    if audio_path.suffix.lower() not in SUPPORTED_AUDIO_EXT:
+        logger.warning(f"Unsupported audio format {audio_path.suffix}, sending as document")
+        try:
+            with open(audio_path, 'rb') as f:
+                await target.reply_document(
+                    document=f,
+                    filename=f"{track_info.get('title', 'audio')[:50]}{audio_path.suffix}",
+                    caption=f"{caption}\n⚠️ Формат не поддерживается для встроенного воспроизведения, но файл сохранён.",
+                    parse_mode='HTML'
+                )
+            return
+        except Exception as e:
+            logger.error(f"Error sending as document: {e}")
+            return
 
     track_id = secrets.token_hex(8)
     if 'temp_tracks' not in context.user_data:
@@ -178,6 +264,17 @@ async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFA
         logger.info(f"Audio sent with add button: {track_info.get('title')[:50]}")
     except Exception as e:
         logger.error(f"Error sending audio: {e}")
+        # Если не удалось отправить как аудио, пробуем как документ
+        try:
+            with open(audio_path, 'rb') as f:
+                await target.reply_document(
+                    document=f,
+                    filename=f"{track_info.get('title', 'audio')[:50]}{audio_path.suffix}",
+                    caption=f"{caption}\n⚠️ Не удалось отправить как аудио, файл сохранён.",
+                    parse_mode='HTML'
+                )
+        except Exception as e2:
+            logger.error(f"Error sending as fallback document: {e2}")
 
 # ---------- Обработчики команд ----------
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -260,20 +357,28 @@ async def play_from_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     track = playlist[index]
     url = track['url']
+    
+    logger.info(f"Playing track from playlist: {track.get('title')} (index {index})")
+    
     status_msg = await update.message.reply_text(f"🎵 Скачиваю: {escape_html(track['title'][:50])}...")
     tmpdir = tempfile.mkdtemp()
     try:
         out = Path(tmpdir) / f"{sanitize_filename(track['title'])}"
         result = await download_audio_from_url(url, out)
+        
         if not result or not result.exists():
-            await status_msg.edit_text("❌ Ошибка скачивания.")
+            logger.error(f"Download failed for track: {track.get('title')}")
+            await status_msg.edit_text("❌ Ошибка скачивания. Попробуйте другой трек.")
             return
+        
+        logger.info(f"Download complete: {result} ({result.stat().st_size} bytes)")
         
         caption = f"🎵 <b>{escape_html(track['title'][:100])}</b>\n📌 Из плейлиста"
         await send_audio_with_add_button(update, context, result, caption, track)
         await status_msg.delete()
+        
     except Exception as e:
-        logger.exception("Error in play_from_playlist")
+        logger.exception(f"Error in play_from_playlist for track {track.get('title')}: {e}")
         try:
             await status_msg.edit_text("❌ Произошла ошибка при воспроизведении.")
         except:
@@ -306,14 +411,21 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     selected = results[idx]
+    
+    logger.info(f"Selected track from search: {selected.get('title')}")
+    
     await query.edit_message_text(f"⬇️ Скачиваю: {escape_html(selected['title'][:80])}...")
     tmpdir = tempfile.mkdtemp()
     try:
         out = Path(tmpdir) / f"{sanitize_filename(selected['title'])}"
         result = await download_audio_from_url(selected['url'], out)
+        
         if not result or not result.exists():
+            logger.error(f"Download failed for selected track: {selected.get('title')}")
             await query.edit_message_text("❌ Ошибка скачивания.")
             return
+        
+        logger.info(f"Download complete: {result} ({result.stat().st_size} bytes)")
         
         context.user_data['last_track'] = {
             'title': selected['title'],
@@ -323,11 +435,13 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
         }
         caption = f"🎵 <b>{escape_html(selected['title'][:100])}</b>"
         await send_audio_with_add_button(query, context, result, caption, selected)
+        
         if query.message:
             try:
                 await query.message.delete()
             except:
                 pass
+                
     except Exception as e:
         logger.error(f"Error in select_track_callback: {e}")
         await query.edit_message_text("❌ Произошла ошибка.")
@@ -365,6 +479,8 @@ async def add_track_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     user_id = update.effective_user.id
+    
+    logger.info(f"Adding track to playlist: {track_info.get('title')} for user {user_id}")
     
     # Добавляем в базу данных
     added = await database.add_track_to_playlist(user_id, track_info)
