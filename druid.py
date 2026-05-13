@@ -54,7 +54,7 @@ for uid in admin_ids_str.split(","):
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING
+    level=logging.INFO  # Изменено с WARNING на INFO для отладки
 )
 logger = logging.getLogger(__name__)
 
@@ -647,6 +647,34 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode='HTML')
 
+# ---------- /checkdb (для админов) ----------
+async def check_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка состояния базы данных (только для админов)"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+    
+    import aiosqlite
+    # Проверяем количество треков в плейлистах
+    async with aiosqlite.connect(database.DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM playlists")
+        total = await cursor.fetchone()
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        users = await cursor.fetchone()
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM playlists WHERE user_id=?", (user_id,))
+        my_tracks = await cursor.fetchone()
+        
+        await update.message.reply_text(
+            f"📊 Статистика БД:\n"
+            f"• Всего треков в плейлистах: {total[0]}\n"
+            f"• Всего пользователей: {users[0]}\n"
+            f"• Ваших треков: {my_tracks[0]}\n"
+            f"• Путь к БД: {database.DB_PATH}"
+        )
+
 # ---------- /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -671,43 +699,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML'
     )
 
-# ---------- main ----------
-def main():
-    """Точка входа"""
+# ---------- main (асинхронная) ----------
+async def main():
+    """Точка входа (асинхронная)"""
     print("🚀 Бот запущен. Нажмите Ctrl+C для остановки.")
-
+    
     # Инициализируем базу данных
-    asyncio.run(database.init_db())
-
+    await database.init_db()
+    print("✅ База данных инициализирована")
+    
     # Создаём приложение
     app = Application.builder().token(TOKEN).build()
-
+    
     # Основные команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("users", users_command))
-
+    app.add_handler(CommandHandler("checkdb", check_db_command))
+    
     # Обработчик ссылок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    
     # Музыкальные команды
     app.add_handler(CommandHandler("search", music.search_command))
     app.add_handler(CommandHandler("playlist", music.playlist_command))
     app.add_handler(CommandHandler("addtoplaylist", music.add_to_playlist_command))
     app.add_handler(CommandHandler("removefromplaylist", music.remove_from_playlist_command))
     app.add_handler(CommandHandler("play", music.play_from_playlist))
-
+    
     # Callback-обработчики
     app.add_handler(CallbackQueryHandler(music.select_track_callback, pattern="^(select_track_|cancel_search)"))
     app.add_handler(CallbackQueryHandler(music.add_track_callback, pattern="^add_track_"))
-
+    
     try:
-        # run_polling сам управляет event loop
-        app.run_polling(drop_pending_updates=True)
-    except NetworkError:
-        logger.warning("NetworkError in polling loop")
+        # Запускаем бота
+        await app.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен.")
-
+    except NetworkError as e:
+        logger.error(f"NetworkError: {e}")
+    except Exception as e:
+        logger.exception(f"Неожиданная ошибка: {e}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

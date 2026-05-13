@@ -21,6 +21,8 @@ import logging
 
 import database
 
+logger = logging.getLogger(__name__)
+
 # ---------- общие утилиты ----------
 def escape_html(text: str) -> str:
     if not text:
@@ -70,7 +72,8 @@ async def get_shazam_track_info(session, url: str):
                     artist = data['byArtist']['name'] if isinstance(data['byArtist'], dict) else str(data['byArtist'])
                     return title, artist
             return None
-    except Exception:
+    except Exception as e:
+        logger.error(f"Shazam parsing error: {e}")
         return None
 
 # ---------- Поиск через SoundCloud ----------
@@ -90,8 +93,9 @@ async def search_tracks_soundcloud(query: str, max_results=5):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0 or not stdout:
+            logger.error(f"yt-dlp search error: {stderr.decode()}")
             return []
         results = []
         for line in stdout.decode().strip().split('\n'):
@@ -106,10 +110,12 @@ async def search_tracks_soundcloud(query: str, max_results=5):
                     'url': info.get('webpage_url') or info.get('url'),
                     'uploader': info.get('uploader', '')
                 })
-            except:
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
                 continue
         return results[:max_results]
-    except Exception:
+    except Exception as e:
+        logger.error(f"Search error: {e}")
         return []
 
 async def download_audio_from_url(url: str, output_path: Path):
@@ -127,10 +133,12 @@ async def download_audio_from_url(url: str, output_path: Path):
         proc = await asyncio.create_subprocess_exec(*cmd)
         await asyncio.wait_for(proc.wait(), timeout=120)
         if proc.returncode != 0:
+            logger.error(f"Download failed with code {proc.returncode}")
             return None
         matches = list(output_path.parent.glob(f"{base_path.stem}.*"))
         return matches[0] if matches else None
-    except Exception:
+    except Exception as e:
+        logger.error(f"Download error: {e}")
         return None
 
 # ---------- Отправка аудио с кнопкой "Добавить в плейлист" ----------
@@ -141,7 +149,9 @@ async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFA
         target = update_or_query.message
     else:
         target = update_or_query.message
+    
     if not target:
+        logger.error("No target for send_audio_with_add_button")
         return
 
     track_id = secrets.token_hex(8)
@@ -156,14 +166,18 @@ async def send_audio_with_add_button(update_or_query, context: ContextTypes.DEFA
         [InlineKeyboardButton("➕ Добавить в плейлист", callback_data=f"add_track_{track_id}")]
     ])
 
-    with open(audio_path, 'rb') as f:
-        await target.reply_audio(
-            audio=f,
-            caption=caption,
-            parse_mode='HTML',
-            title=track_info.get('title', 'Аудио')[:50],
-            reply_markup=keyboard
-        )
+    try:
+        with open(audio_path, 'rb') as f:
+            await target.reply_audio(
+                audio=f,
+                caption=caption,
+                parse_mode='HTML',
+                title=track_info.get('title', 'Аудио')[:50],
+                reply_markup=keyboard
+            )
+        logger.info(f"Audio sent with add button: {track_info.get('title')[:50]}")
+    except Exception as e:
+        logger.error(f"Error sending audio: {e}")
 
 # ---------- Обработчики команд ----------
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -177,6 +191,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not results:
         await status_msg.edit_text("❌ Ничего не найдено на SoundCloud.")
         return
+    
     context.user_data['search_results'] = results
     keyboard = []
     for idx, track in enumerate(results):
@@ -194,6 +209,7 @@ async def playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not playlist:
         await update.message.reply_text("📭 Ваш плейлист пуст.")
         return
+    
     text = "🎵 <b>Ваш плейлист</b>\n\n"
     for i, track in enumerate(playlist):
         title = escape_html(track.get('title', 'Без названия')[:60])
@@ -208,6 +224,7 @@ async def add_to_playlist_command(update: Update, context: ContextTypes.DEFAULT_
     if not last_track:
         await update.message.reply_text("❌ Нет информации о последнем треке. Используйте кнопку под аудио.")
         return
+    
     added = await database.add_track_to_playlist(user_id, last_track)
     if added:
         await update.message.reply_text(f"✅ Добавлено: {escape_html(last_track['title'][:50])}", parse_mode='HTML')
@@ -219,6 +236,7 @@ async def remove_from_playlist_command(update: Update, context: ContextTypes.DEF
     if not args or not args[0].isdigit():
         await update.message.reply_text("ℹ️ /removefromplaylist 3")
         return
+    
     index = int(args[0]) - 1
     user_id = update.effective_user.id
     removed = await database.remove_track_from_playlist(user_id, index)
@@ -232,12 +250,14 @@ async def play_from_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not args or not args[0].isdigit():
         await update.message.reply_text("ℹ️ /play 2")
         return
+    
     index = int(args[0]) - 1
     user_id = update.effective_user.id
     playlist = await database.get_user_playlist(user_id)
     if index < 0 or index >= len(playlist):
         await update.message.reply_text("❌ Неверный номер.")
         return
+    
     track = playlist[index]
     url = track['url']
     status_msg = await update.message.reply_text(f"🎵 Скачиваю: {escape_html(track['title'][:50])}...")
@@ -248,11 +268,12 @@ async def play_from_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not result or not result.exists():
             await status_msg.edit_text("❌ Ошибка скачивания.")
             return
+        
         caption = f"🎵 <b>{escape_html(track['title'][:100])}</b>\n📌 Из плейлиста"
         await send_audio_with_add_button(update, context, result, caption, track)
         await status_msg.delete()
     except Exception as e:
-        logging.getLogger(__name__).exception("Error in play_from_playlist")
+        logger.exception("Error in play_from_playlist")
         try:
             await status_msg.edit_text("❌ Произошла ошибка при воспроизведении.")
         except:
@@ -264,21 +285,26 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
+    
     if data == "cancel_search":
         await query.edit_message_text("❌ Поиск отменён.")
         context.user_data.pop('search_results', None)
         return
+    
     if not data.startswith("select_track_"):
         return
+    
     try:
         idx = int(data.split("_")[-1])
     except:
         await query.edit_message_text("❌ Ошибка: неверный формат.")
         return
+    
     results = context.user_data.get('search_results', [])
     if idx >= len(results):
         await query.edit_message_text("❌ Ошибка: вариант не найден.")
         return
+    
     selected = results[idx]
     await query.edit_message_text(f"⬇️ Скачиваю: {escape_html(selected['title'][:80])}...")
     tmpdir = tempfile.mkdtemp()
@@ -288,6 +314,7 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if not result or not result.exists():
             await query.edit_message_text("❌ Ошибка скачивания.")
             return
+        
         context.user_data['last_track'] = {
             'title': selected['title'],
             'url': selected['url'],
@@ -301,8 +328,12 @@ async def select_track_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.message.delete()
             except:
                 pass
+    except Exception as e:
+        logger.error(f"Error in select_track_callback: {e}")
+        await query.edit_message_text("❌ Произошла ошибка.")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    
     # Очищаем временные данные поиска
     context.user_data.pop('search_results', None)
 
@@ -310,39 +341,61 @@ async def add_track_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     data = query.data
+    
     if not data.startswith("add_track_"):
         return
+    
     track_id = data.split("_", 2)[2]
-    temp_tracks = context.user_data.get('temp_tracks')
-    track_info = temp_tracks.get(track_id) if temp_tracks else None
-    if not track_info:
-        await query.answer("Информация о треке устарела. Скачайте заново.", show_alert=True)
+    
+    # Проверяем наличие временных треков
+    if 'temp_tracks' not in context.user_data:
+        await query.answer("❌ Ошибка: нет данных о треке", show_alert=True)
         return
+    
+    temp_tracks = context.user_data.get('temp_tracks', {})
+    track_info = temp_tracks.get(track_id)
+    
+    if not track_info:
+        await query.answer("❌ Информация о треке устарела. Скачайте заново.", show_alert=True)
+        return
+    
+    # Проверяем, что track_info содержит url
+    if not track_info.get('url'):
+        await query.answer("❌ Ошибка: у трека нет URL", show_alert=True)
+        return
+    
     user_id = update.effective_user.id
+    
+    # Добавляем в базу данных
     added = await database.add_track_to_playlist(user_id, track_info)
+    
     if added:
-        # Меняем только клавиатуру, оставляя оригинальное аудиосообщение
+        # Убираем кнопку у сообщения
         try:
-            # Убираем кнопку
             new_markup = InlineKeyboardMarkup([])  # пустая клавиатура
             await query.edit_message_reply_markup(reply_markup=new_markup)
-            await query.answer(f"✅ Добавлено: {track_info['title'][:50]}", show_alert=True)
-        except Exception:
-            await query.answer(f"✅ Добавлено (но кнопка осталась)", show_alert=True)
+            await query.answer(f"✅ Добавлено: {track_info.get('title', 'трек')[:50]}", show_alert=False)
+        except Exception as e:
+            logger.error(f"Error removing button: {e}")
+            await query.answer(f"✅ Добавлено в плейлист!", show_alert=True)
     else:
-        await query.answer("⚠️ Трек уже в вашем плейлисте.", show_alert=True)
+        await query.answer("⚠️ Трек уже есть в вашем плейлисте", show_alert=True)
+    
     # Удаляем временный трек
-    if temp_tracks:
-        temp_tracks.pop(track_id, None)
+    temp_tracks.pop(track_id, None)
+    if not temp_tracks:
+        context.user_data.pop('temp_tracks', None)
 
 async def handle_shazam_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, session):
     if not update.message:
         return
+    
     status_msg = await update.message.reply_text("🔍 Анализирую Shazam...")
     shazam_info = await get_shazam_track_info(session, url)
     if not shazam_info:
         await status_msg.edit_text("❌ Не удалось распознать трек.")
         return
+    
     title, artist = shazam_info
     query = f"{artist} {title}" if artist else title
     await status_msg.edit_text(f"🎵 Найден: {escape_html(title)} — {escape_html(artist)}\nИщу на SoundCloud...", parse_mode='HTML')
@@ -350,6 +403,7 @@ async def handle_shazam_url(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not results:
         await status_msg.edit_text(f"❌ Ничего не найдено на SoundCloud. Попробуйте: /search {escape_html(query)}")
         return
+    
     context.user_data['search_results'] = results
     keyboard = []
     for idx, track in enumerate(results):

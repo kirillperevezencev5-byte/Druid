@@ -1,7 +1,9 @@
 import aiosqlite
 import json
+import os
 
-DB_PATH = "bot.db"
+# Используем абсолютный путь к БД
+DB_PATH = os.path.join(os.path.dirname(__file__), "bot.db")
 
 async def init_db():
     """Создаёт таблицы, если их нет"""
@@ -24,8 +26,11 @@ async def init_db():
                 added_at TEXT,
                 UNIQUE(user_id, url)
             );
+            CREATE INDEX IF NOT EXISTS idx_playlists_user ON playlists(user_id);
+            CREATE INDEX IF NOT EXISTS idx_playlists_url ON playlists(url);
         """)
         await db.commit()
+    print("✅ База данных инициализирована")
 
 async def log_user_activity(user_id: int, first_name: str, username: str, chat_id: int):
     """Фиксирует активность пользователя и группу (если сообщение из группы)"""
@@ -58,16 +63,40 @@ async def get_all_users():
 
 async def add_track_to_playlist(user_id: int, track_info: dict) -> bool:
     """Добавляет трек в плейлист. Возвращает True, если добавлен, False если уже был."""
+    # Проверяем обязательные поля
+    if not track_info.get('url'):
+        print(f"❌ Ошибка: нет url в track_info: {track_info}")
+        return False
+    
+    if not track_info.get('title'):
+        print(f"⚠️ Предупреждение: нет title в track_info, использую 'Без названия'")
+        track_info['title'] = 'Без названия'
+    
     async with aiosqlite.connect(DB_PATH) as db:
         try:
             await db.execute("""
                 INSERT OR IGNORE INTO playlists (user_id, url, title, duration, uploader, added_at)
                 VALUES (?, ?, ?, ?, ?, datetime('now'))
-            """, (user_id, track_info['url'], track_info.get('title', ''),
-                  track_info.get('duration', 0), track_info.get('uploader', '')))
+            """, (user_id, track_info['url'], track_info.get('title', 'Без названия')[:200],
+                  track_info.get('duration', 0), track_info.get('uploader', '')[:100]))
             await db.commit()
-            return db.total_changes > 0
-        except Exception:
+            
+            # Проверяем, добавилась ли запись
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM playlists WHERE user_id=? AND url=?", 
+                (user_id, track_info['url'])
+            )
+            count = await cursor.fetchone()
+            added = count[0] > 0
+            
+            if added:
+                print(f"✅ Трек добавлен в плейлист: {track_info['title'][:50]} для user {user_id}")
+            else:
+                print(f"⚠️ Трек уже существует в плейлисте: {track_info['title'][:50]}")
+            
+            return added
+        except Exception as e:
+            print(f"❌ Ошибка добавления в плейлист: {e}")
             return False
 
 async def remove_track_from_playlist(user_id: int, index: int):
@@ -82,12 +111,14 @@ async def remove_track_from_playlist(user_id: int, index: int):
             removed = tracks[index]
             await db.execute("DELETE FROM playlists WHERE id=?", (track_id,))
             await db.commit()
+            print(f"🗑️ Трек удалён из плейлиста: {removed[2]} для user {user_id}")
             return {
                 'url': removed[1],
                 'title': removed[2],
                 'duration': removed[3],
                 'uploader': removed[4]
             }
+        print(f"⚠️ Неверный индекс {index} для user {user_id}")
         return None
 
 async def get_user_playlist(user_id: int) -> list[dict]:
@@ -98,4 +129,6 @@ async def get_user_playlist(user_id: int) -> list[dict]:
             "SELECT url, title, duration, uploader, added_at FROM playlists WHERE user_id=? ORDER BY added_at",
             (user_id,))
         rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        playlist = [dict(r) for r in rows]
+        print(f"📋 Получен плейлист для user {user_id}: {len(playlist)} треков")
+        return playlist
